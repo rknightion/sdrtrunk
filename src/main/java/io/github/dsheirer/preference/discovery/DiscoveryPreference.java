@@ -18,6 +18,8 @@
  */
 package io.github.dsheirer.preference.discovery;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.module.discovery.IgnoreRange;
 import io.github.dsheirer.preference.Preference;
@@ -29,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.prefs.Preferences;
 import org.slf4j.Logger;
@@ -42,13 +45,22 @@ import org.slf4j.LoggerFactory;
  * setters notify via {@link #notifyPreferenceUpdated()}.</p>
  *
  * <h3>Ignore-list serialisation</h3>
- * Each {@link IgnoreRange} is encoded as a pipe-delimited record
- * ({@code min|max|note|addedAt}) and the whole list is stored as a
- * newline-delimited string under a single preference key.
+ * The ignore list is serialised as a JSON array of objects, each with fields
+ * {@code minHz}, {@code maxHz}, {@code note} (string, may be null), and
+ * {@code addedAtEpochMs} (long, epoch milliseconds).  Notes containing {@code |}
+ * or newlines are fully supported.
+ *
+ * <p>Note: {@code Preferences.put} silently truncates values past ~8 192 chars.
+ * If the serialised list exceeds that limit a warning is logged; existing entries
+ * are preserved in memory but only the truncated bytes are stored on disk.
+ * This is an acceptable limitation for Phase 1.</p>
  */
 public class DiscoveryPreference extends Preference
 {
     private static final Logger mLog = LoggerFactory.getLogger(DiscoveryPreference.class);
+
+    /** Maximum safe length for a single {@code Preferences} string value. */
+    private static final int PREFS_MAX_CHARS = 8_000;
 
     // -------------------------------------------------------------------------
     // Preference keys
@@ -58,7 +70,7 @@ public class DiscoveryPreference extends Preference
     private static final String KEY_ENERGY_THRESHOLD_DB      = "discovery.energy.threshold.db";
     private static final String KEY_MAX_CONCURRENT_PROBES    = "discovery.max.concurrent.probes";
     private static final String KEY_MAX_CONCURRENT_CLASS     = "discovery.max.concurrent.classifications";
-    private static final String KEY_TUNER_HEADROOM_HZ        = "discovery.tuner.headroom.hz";
+    private static final String KEY_TUNER_HEADROOM_CHANNELS  = "discovery.tuner.headroom.channels";
     private static final String KEY_CLICK_DEFAULT_BW_HZ      = "discovery.click.default.bandwidth.hz";
     private static final String KEY_KEEP_LISTENING_SECONDS   = "discovery.keep.listening.seconds";
     private static final String KEY_OVERLAY_DISPLAY          = "discovery.overlay.display";
@@ -68,14 +80,14 @@ public class DiscoveryPreference extends Preference
     // Defaults (package-visible for test verification)
     // -------------------------------------------------------------------------
 
-    static final int     DEFAULT_SURVEY_DWELL_SECONDS    = 3;
-    static final double  DEFAULT_ENERGY_THRESHOLD_DB     = 6.0;
-    static final int     DEFAULT_MAX_CONCURRENT_PROBES   = 2;
-    static final int     DEFAULT_MAX_CONCURRENT_CLASS    = 1;
-    static final int     DEFAULT_TUNER_HEADROOM_HZ       = 0;
-    static final int     DEFAULT_CLICK_DEFAULT_BW_HZ     = 12_500;
-    static final int     DEFAULT_KEEP_LISTENING_SECONDS  = 30;
-    static final String  DEFAULT_OVERLAY_DISPLAY         = OverlayDisplay.IDENTIFIED_ONLY.name();
+    static final int     DEFAULT_SURVEY_DWELL_SECONDS      = 3;
+    static final double  DEFAULT_ENERGY_THRESHOLD_DB       = 6.0;
+    static final int     DEFAULT_MAX_CONCURRENT_PROBES     = 2;
+    static final int     DEFAULT_MAX_CONCURRENT_CLASS      = 1;
+    static final int     DEFAULT_TUNER_HEADROOM_CHANNELS   = 0;
+    static final int     DEFAULT_CLICK_DEFAULT_BW_HZ       = 12_500;
+    static final int     DEFAULT_KEEP_LISTENING_SECONDS    = 30;
+    static final String  DEFAULT_OVERLAY_DISPLAY           = OverlayDisplay.IDENTIFIED_ONLY.name();
 
     /**
      * Per-decoder probe windows (milliseconds).  These represent the maximum time
@@ -101,6 +113,12 @@ public class DiscoveryPreference extends Preference
     private static final long DEFAULT_PROBE_WINDOW_MS = 4_000L;
 
     // -------------------------------------------------------------------------
+    // Jackson mapper — plain JSON, no special modules needed (epoch-ms longs)
+    // -------------------------------------------------------------------------
+
+    private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
+
+    // -------------------------------------------------------------------------
     // Lazy-cached fields (null = not yet loaded)
     // -------------------------------------------------------------------------
 
@@ -110,7 +128,7 @@ public class DiscoveryPreference extends Preference
     private Double   mEnergyThresholdDb;
     private Integer  mMaxConcurrentProbes;
     private Integer  mMaxConcurrentClassifications;
-    private Integer  mTunerHeadroomHz;
+    private Integer  mTunerHeadroomChannels;
     private Integer  mClickDefaultBandwidthHz;
     private Integer  mKeepListeningSeconds;
     private OverlayDisplay mOverlayDisplay;
@@ -182,6 +200,8 @@ public class DiscoveryPreference extends Preference
 
     /**
      * SNR threshold (dB) above which a frequency is considered to have a signal worth probing.
+     * This is a floor-relative value: the classifier returns NO_SIGNAL if the peak reading
+     * is not at least this many dB above the estimated noise floor.
      *
      * @return threshold in dB (default 6.0)
      */
@@ -282,39 +302,44 @@ public class DiscoveryPreference extends Preference
     }
 
     // -------------------------------------------------------------------------
-    // Tuner headroom
+    // Tuner headroom channels
     // -------------------------------------------------------------------------
 
     /**
-     * Minimum clear headroom (Hz) required at the edge of the tuner's passband before a
-     * frequency is eligible for click-to-tune.  0 = no restriction.
+     * Number of tuner channels to keep free (headroom) for the operator.
+     * 0 = no restriction; positive values reserve that many slots before
+     * allowing a classification to acquire a source.
      *
-     * @return headroom in Hz (default 0)
+     * <p>Note: since {@code TunerManager.getSource()} returning {@code null} already
+     * signals "no capacity", this setting is advisory; enforcement is deferred to
+     * a future scheduler layer.  It is persisted so callers can read it.</p>
+     *
+     * @return number of channels to keep free (default 0)
      */
-    public int getTunerHeadroomHz()
+    public int getTunerHeadroomChannels()
     {
-        if(mTunerHeadroomHz == null)
+        if(mTunerHeadroomChannels == null)
         {
-            mTunerHeadroomHz = mPreferences.getInt(KEY_TUNER_HEADROOM_HZ, DEFAULT_TUNER_HEADROOM_HZ);
+            mTunerHeadroomChannels = mPreferences.getInt(KEY_TUNER_HEADROOM_CHANNELS, DEFAULT_TUNER_HEADROOM_CHANNELS);
         }
 
-        return mTunerHeadroomHz;
+        return mTunerHeadroomChannels;
     }
 
     /**
-     * Sets the tuner headroom.
+     * Sets the tuner headroom channel count.
      *
-     * @param headroomHz must not be negative
+     * @param channels must not be negative
      */
-    public void setTunerHeadroomHz(int headroomHz)
+    public void setTunerHeadroomChannels(int channels)
     {
-        if(headroomHz < 0)
+        if(channels < 0)
         {
             throw new IllegalArgumentException("tuner headroom must not be negative");
         }
 
-        mTunerHeadroomHz = headroomHz;
-        mPreferences.putInt(KEY_TUNER_HEADROOM_HZ, headroomHz);
+        mTunerHeadroomChannels = channels;
+        mPreferences.putInt(KEY_TUNER_HEADROOM_CHANNELS, channels);
         notifyPreferenceUpdated();
     }
 
@@ -537,13 +562,38 @@ public class DiscoveryPreference extends Preference
     }
 
     // -------------------------------------------------------------------------
-    // Ignore-list serialisation helpers
+    // Ignore-list JSON serialisation helpers
     // -------------------------------------------------------------------------
 
-    /** Field separator within one ignore-range record. */
-    private static final String FIELD_SEP = "|";
-    /** Separator between records in the persisted string. */
-    private static final String RECORD_SEP = "\n";
+    /**
+     * JSON DTO for one ignore range entry.  Uses plain long fields to avoid requiring
+     * a Jackson JavaTimeModule (Instant is stored as epoch-milliseconds).
+     */
+    static class IgnoreRangeDto
+    {
+        public long minHz;
+        public long maxHz;
+        public String note;
+        public long addedAtEpochMs;
+
+        /** No-arg constructor for Jackson deserialisation. */
+        public IgnoreRangeDto() {}
+
+        static IgnoreRangeDto from(IgnoreRange r)
+        {
+            IgnoreRangeDto dto = new IgnoreRangeDto();
+            dto.minHz = r.minHz();
+            dto.maxHz = r.maxHz();
+            dto.note  = r.note();
+            dto.addedAtEpochMs = r.addedAt().toEpochMilli();
+            return dto;
+        }
+
+        IgnoreRange toIgnoreRange()
+        {
+            return new IgnoreRange(minHz, maxHz, note, Instant.ofEpochMilli(addedAtEpochMs));
+        }
+    }
 
     private List<IgnoreRange> loadIgnoreList()
     {
@@ -555,28 +605,25 @@ public class DiscoveryPreference extends Preference
             return list;
         }
 
-        for(String record : raw.split(RECORD_SEP, -1))
+        try
         {
-            if(record.isBlank())
-            {
-                continue;
-            }
+            List<IgnoreRangeDto> dtos = JSON_MAPPER.readValue(raw, new TypeReference<List<IgnoreRangeDto>>(){});
 
-            try
+            for(IgnoreRangeDto dto : dtos)
             {
-                String[] parts = record.split("\\|", 4);
-                long min  = Long.parseLong(parts[0]);
-                long max  = Long.parseLong(parts[1]);
-                String note = parts.length > 2 ? parts[2] : "";
-                Instant addedAt = parts.length > 3 && !parts[3].isBlank()
-                    ? Instant.parse(parts[3])
-                    : Instant.now();
-                list.add(new IgnoreRange(min, max, note, addedAt));
+                try
+                {
+                    list.add(dto.toIgnoreRange());
+                }
+                catch(Exception e)
+                {
+                    mLog.warn("Skipping invalid ignore-range entry: {}", e.getMessage());
+                }
             }
-            catch(Exception e)
-            {
-                mLog.warn("Could not parse ignore-range record '{}': {}", record, e.getMessage());
-            }
+        }
+        catch(Exception e)
+        {
+            mLog.warn("Could not parse ignore-list JSON: {}", e.getMessage());
         }
 
         return list;
@@ -590,24 +637,29 @@ public class DiscoveryPreference extends Preference
             return;
         }
 
-        StringBuilder sb = new StringBuilder();
-
-        for(IgnoreRange r : mIgnoreList)
+        try
         {
-            if(sb.length() > 0)
+            List<IgnoreRangeDto> dtos = new ArrayList<>(mIgnoreList.size());
+
+            for(IgnoreRange r : mIgnoreList)
             {
-                sb.append(RECORD_SEP);
+                dtos.add(IgnoreRangeDto.from(r));
             }
 
-            sb.append(r.minHz())
-              .append(FIELD_SEP)
-              .append(r.maxHz())
-              .append(FIELD_SEP)
-              .append(r.note() != null ? r.note() : "")
-              .append(FIELD_SEP)
-              .append(r.addedAt().toString());
-        }
+            String json = JSON_MAPPER.writeValueAsString(dtos);
 
-        mPreferences.put(KEY_IGNORE_LIST, sb.toString());
+            if(json.length() > PREFS_MAX_CHARS)
+            {
+                mLog.warn("Discovery ignore list exceeds Preferences storage limit ({} chars > {}); "
+                    + "list is stored in memory but may be truncated on disk.",
+                    json.length(), PREFS_MAX_CHARS);
+            }
+
+            mPreferences.put(KEY_IGNORE_LIST, json);
+        }
+        catch(Exception e)
+        {
+            mLog.error("Could not serialise ignore list to JSON: {}", e.getMessage());
+        }
     }
 }

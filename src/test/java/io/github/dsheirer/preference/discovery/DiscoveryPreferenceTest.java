@@ -94,7 +94,7 @@ class DiscoveryPreferenceTest
     @Test
     void default_tunerHeadroomIs0()
     {
-        assertEquals(0, mPreference.getTunerHeadroomHz());
+        assertEquals(0, mPreference.getTunerHeadroomChannels());
     }
 
     @Test
@@ -252,6 +252,36 @@ class DiscoveryPreferenceTest
         assertEquals(160_000_000L, loaded.get(0).minHz());
         assertEquals(161_000_000L, loaded.get(0).maxHz());
         assertEquals("persist me", loaded.get(0).note());
+    }
+
+    @Test
+    void ignoreList_noteWithSpecialChars_roundTrips() throws Exception
+    {
+        // Notes containing pipe, newline, and quotes must survive JSON serialisation
+        String tricky = "has|pipe\nand\nnewlines \"and quotes\"";
+        IgnoreRange r = IgnoreRange.of(170_000_000L, 171_000_000L, tricky);
+        mPreference.addIgnoreRange(r);
+
+        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
+        List<IgnoreRange> loaded = fresh.getIgnoreList();
+        assertEquals(1, loaded.size());
+        assertEquals(tricky, loaded.get(0).note(),
+            "Note with special characters must survive JSON round-trip");
+        assertEquals(170_000_000L, loaded.get(0).minHz());
+        assertEquals(171_000_000L, loaded.get(0).maxHz());
+    }
+
+    // -------------------------------------------------------------------------
+    // Tuner headroom channels
+    // -------------------------------------------------------------------------
+
+    @Test
+    void set_tunerHeadroomChannelsPersists() throws Exception
+    {
+        mPreference.setTunerHeadroomChannels(2);
+
+        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
+        assertEquals(2, fresh.getTunerHeadroomChannels());
     }
 
     // -------------------------------------------------------------------------
