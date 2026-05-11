@@ -1,6 +1,6 @@
 /*
  * *****************************************************************************
- * Copyright (C) 2014-2023 Dennis Sheirer
+ * Copyright (C) 2014-2026 Dennis Sheirer
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,27 +16,19 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  * ****************************************************************************
  */
-
-package io.github.dsheirer.preference;
+package io.github.dsheirer.preference.discovery;
 
 /**
- * Types of preferences
+ * Controls which discovery results are painted on the spectral-display overlay.
  */
-public enum PreferenceType
+public enum OverlayDisplay
 {
-    APPLICATION,
-    CALIBRATION,
-    DECODE_EVENT,
-    DIRECTORY,
-    DISCOVERY,
-    DUPLICATE_CALL_DETECTION,
-    JMBE_LIBRARY,
-    MP3,
-    MULTI_FREQUENCY,
-    PLAYLIST,
-    PLAYBACK,
-    RADIO_REFERENCE,
-    RECORD,
-    TALKGROUP_FORMAT,
-    TUNER;
+    /** Show all discovery rows regardless of their outcome. */
+    ALL,
+
+    /** Show only rows whose outcome is IDENTIFIED (a decoder locked). */
+    IDENTIFIED_ONLY,
+
+    /** Hide the discovery overlay entirely. */
+    NONE
 }
