@@ -23,6 +23,7 @@ import io.github.dsheirer.module.decode.DecoderFactory;
 import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.module.decode.config.DecodeConfiguration;
 import io.github.dsheirer.source.config.SourceConfigTuner;
+import java.util.Locale;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -140,7 +141,7 @@ public class DiscoveryChannelFactory
     {
         // Format as MHz with 3 decimal places (e.g. "Discovered 154.920")
         double mhz = freqHz / 1_000_000.0;
-        String freqLabel = String.format("%.3f", mhz);
+        String freqLabel = String.format(Locale.ROOT, "%.3f", mhz);
         String name = "Discovered " + freqLabel;
 
         if(kind == SignalKind.CONTROL)

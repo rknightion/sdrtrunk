@@ -43,14 +43,16 @@ import io.github.dsheirer.gui.viewer.ViewRecordingViewerRequest;
 import io.github.dsheirer.icon.IconModel;
 import io.github.dsheirer.log.ApplicationLog;
 import io.github.dsheirer.map.MapService;
+import io.github.dsheirer.module.decode.DecoderType;
+import io.github.dsheirer.module.discovery.ClassificationResult;
 import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
 import io.github.dsheirer.module.discovery.ProbeChainFactory;
 import io.github.dsheirer.module.discovery.SignalClassifier;
 import io.github.dsheirer.module.discovery.SourceProvider;
 import io.github.dsheirer.module.log.EventLogManager;
-import io.github.dsheirer.spectrum.ClickToTuneController;
 import io.github.dsheirer.monitor.DiagnosticMonitor;
 import io.github.dsheirer.monitor.ResourceMonitor;
+import io.github.dsheirer.spectrum.ClickToTuneController;
 import io.github.dsheirer.playlist.PlaylistManager;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.properties.SystemProperties;
@@ -92,7 +94,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
 import java.util.prefs.Preferences;
 import javafx.application.Platform;
 import javafx.embed.swing.JFXPanel;
@@ -110,6 +114,7 @@ import javax.swing.JMenu;
 import javax.swing.JMenuBar;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
+import javax.swing.JPopupMenu;
 import javax.swing.JSeparator;
 import javax.swing.KeyStroke;
 import javax.swing.UIManager;
@@ -296,21 +301,22 @@ public class SDRTrunk implements Listener<TunerEvent>
 
                     @Override
                     public void showMissPopup(
-                        io.github.dsheirer.module.discovery.ClassificationResult result,
+                        ClassificationResult result,
                         Runnable redetect,
-                        java.util.function.Consumer<io.github.dsheirer.module.decode.DecoderType> tuneAs)
+                        Consumer<DecoderType> tuneAs)
                     {
                         String outcome = result.outcome().name().replace('_', ' ').toLowerCase();
-                        String freq = String.format("%.4f MHz", result.centerFrequencyHz() / 1e6);
+                        String freq = String.format(Locale.ROOT, "%.4f MHz",
+                            result.centerFrequencyHz() / 1e6);
 
-                        Object[] options = {"Keep listening", "Pick decoder…", "Cancel"};
-                        int choice = javax.swing.JOptionPane.showOptionDialog(
+                        Object[] options = {"Keep listening", "Pick decoder...", "Cancel"};
+                        int choice = JOptionPane.showOptionDialog(
                             mSpectralPanel,
                             "No recognised signal at " + freq + " (" + outcome + ").\n" +
                             "Choose an action:",
                             "Click-to-tune: no match",
-                            javax.swing.JOptionPane.DEFAULT_OPTION,
-                            javax.swing.JOptionPane.INFORMATION_MESSAGE,
+                            JOptionPane.DEFAULT_OPTION,
+                            JOptionPane.INFORMATION_MESSAGE,
                             null,
                             options,
                             options[2]
@@ -318,18 +324,17 @@ public class SDRTrunk implements Listener<TunerEvent>
 
                         if(choice == 0)
                         {
-                            // Keep listening — re-run the classifier with a longer window
+                            // Keep listening -- re-run the classifier with a longer window
                             redetect.run();
                         }
                         else if(choice == 1)
                         {
                             // Build a decoder-picker submenu via a JPopupMenu
-                            javax.swing.JPopupMenu picker = new javax.swing.JPopupMenu("Decode as…");
+                            JPopupMenu picker = new JPopupMenu("Decode as...");
 
-                            for(io.github.dsheirer.module.decode.DecoderType type :
-                                io.github.dsheirer.module.decode.DecoderType.PRIMARY_DECODERS)
+                            for(DecoderType type : DecoderType.PRIMARY_DECODERS)
                             {
-                                javax.swing.JMenuItem item = new javax.swing.JMenuItem(type.getDisplayString());
+                                JMenuItem item = new JMenuItem(type.getDisplayString());
                                 item.addActionListener(e -> tuneAs.accept(type));
                                 picker.add(item);
                             }
@@ -340,16 +345,16 @@ public class SDRTrunk implements Listener<TunerEvent>
                     }
 
                     @Override
-                    public void reportStartFailure(
-                        io.github.dsheirer.controller.channel.Channel channel, String reason)
+                    public void reportStartFailure(Channel channel, String reason)
                     {
                         mLog.warn("Click-to-tune channel '{}' failed to start: {}",
                             channel.getName(), reason);
-                        javax.swing.JOptionPane.showMessageDialog(
+                        JOptionPane.showMessageDialog(
                             mSpectralPanel,
-                            "Could not start channel '" + channel.getName() + "':\n" + reason,
+                            "Could not start channel '" + channel.getName() + "':\n" +
+                                Objects.requireNonNullElse(reason, "unknown error"),
                             "Click-to-tune: start failed",
-                            javax.swing.JOptionPane.WARNING_MESSAGE
+                            JOptionPane.WARNING_MESSAGE
                         );
                     }
                 }
