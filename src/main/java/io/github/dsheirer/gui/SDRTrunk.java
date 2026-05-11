@@ -43,10 +43,12 @@ import io.github.dsheirer.gui.viewer.ViewRecordingViewerRequest;
 import io.github.dsheirer.icon.IconModel;
 import io.github.dsheirer.log.ApplicationLog;
 import io.github.dsheirer.map.MapService;
+import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
 import io.github.dsheirer.module.discovery.ProbeChainFactory;
 import io.github.dsheirer.module.discovery.SignalClassifier;
 import io.github.dsheirer.module.discovery.SourceProvider;
 import io.github.dsheirer.module.log.EventLogManager;
+import io.github.dsheirer.spectrum.ClickToTuneController;
 import io.github.dsheirer.monitor.DiagnosticMonitor;
 import io.github.dsheirer.monitor.ResourceMonitor;
 import io.github.dsheirer.playlist.PlaylistManager;
@@ -267,6 +269,96 @@ public class SDRTrunk implements Listener<TunerEvent>
         }
 
         mSpectralPanel = new SpectralDisplayPanel(mPlaylistManager, mSettingsManager, mTunerManager.getDiscoveredTunerModel());
+
+        // --- Click-to-tune controller (Phase 2) --------------------------------
+        if(!headless)
+        {
+            DiscoveryChannelFactory channelFactory = new DiscoveryChannelFactory();
+            ClickToTuneController clickToTuneController = new ClickToTuneController(
+                mSignalClassifier,
+                mPlaylistManager.getChannelModel(),
+                mPlaylistManager.getChannelProcessingManager(),
+                channelFactory,
+                mUserPreferences,
+                new ClickToTuneController.UICallbacks()
+                {
+                    @Override
+                    public void showPending(long centerFreqHz, int widthHz)
+                    {
+                        // The SpectralDisplayPanel's pending overlay handles this via its own callback.
+                        // No separate action needed here.
+                    }
+
+                    @Override
+                    public void clearPending()
+                    {
+                        // The SpectralDisplayPanel's pending overlay clears itself on cancel/complete.
+                    }
+
+                    @Override
+                    public void showMissPopup(
+                        io.github.dsheirer.module.discovery.ClassificationResult result,
+                        Runnable redetect,
+                        java.util.function.Consumer<io.github.dsheirer.module.decode.DecoderType> tuneAs)
+                    {
+                        String outcome = result.outcome().name().replace('_', ' ').toLowerCase();
+                        String freq = String.format("%.4f MHz", result.centerFrequencyHz() / 1e6);
+
+                        Object[] options = {"Keep listening", "Pick decoder…", "Cancel"};
+                        int choice = javax.swing.JOptionPane.showOptionDialog(
+                            mSpectralPanel,
+                            "No recognised signal at " + freq + " (" + outcome + ").\n" +
+                            "Choose an action:",
+                            "Click-to-tune: no match",
+                            javax.swing.JOptionPane.DEFAULT_OPTION,
+                            javax.swing.JOptionPane.INFORMATION_MESSAGE,
+                            null,
+                            options,
+                            options[2]
+                        );
+
+                        if(choice == 0)
+                        {
+                            // Keep listening — re-run the classifier with a longer window
+                            redetect.run();
+                        }
+                        else if(choice == 1)
+                        {
+                            // Build a decoder-picker submenu via a JPopupMenu
+                            javax.swing.JPopupMenu picker = new javax.swing.JPopupMenu("Decode as…");
+
+                            for(io.github.dsheirer.module.decode.DecoderType type :
+                                io.github.dsheirer.module.decode.DecoderType.PRIMARY_DECODERS)
+                            {
+                                javax.swing.JMenuItem item = new javax.swing.JMenuItem(type.getDisplayString());
+                                item.addActionListener(e -> tuneAs.accept(type));
+                                picker.add(item);
+                            }
+
+                            picker.show(mSpectralPanel, mSpectralPanel.getWidth() / 2,
+                                mSpectralPanel.getHeight() / 2);
+                        }
+                    }
+
+                    @Override
+                    public void reportStartFailure(
+                        io.github.dsheirer.controller.channel.Channel channel, String reason)
+                    {
+                        mLog.warn("Click-to-tune channel '{}' failed to start: {}",
+                            channel.getName(), reason);
+                        javax.swing.JOptionPane.showMessageDialog(
+                            mSpectralPanel,
+                            "Could not start channel '" + channel.getName() + "':\n" + reason,
+                            "Click-to-tune: start failed",
+                            javax.swing.JOptionPane.WARNING_MESSAGE
+                        );
+                    }
+                }
+            );
+
+            mSpectralPanel.setClickToTuneController(clickToTuneController);
+        }
+        // --- End click-to-tune controller --------------------------------------
 
         TunerSpectralDisplayManager tunerSpectralDisplayManager = new TunerSpectralDisplayManager(mSpectralPanel,
             mPlaylistManager, mSettingsManager, mTunerManager.getDiscoveredTunerModel());
