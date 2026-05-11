@@ -82,7 +82,7 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link ProbeChainFactory} — injected; tests supply scripted fakes</li>
  * </ul>
  */
-public class SignalClassifier
+public class SignalClassifier implements Classifier
 {
     private static final Logger mLog = LoggerFactory.getLogger(SignalClassifier.class);
 

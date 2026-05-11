@@ -72,7 +72,7 @@ import org.slf4j.LoggerFactory;
  * the constructor binds {@code TunerManager.getSource}; tests inject a fake that delivers canned
  * {@link ComplexSamples} buffers without a real tuner.</p>
  */
-public class SpectralSurvey
+public class SpectralSurvey implements SpectralSurveyApi
 {
     private static final Logger mLog = LoggerFactory.getLogger(SpectralSurvey.class);
 
