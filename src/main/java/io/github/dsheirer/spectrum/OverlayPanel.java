@@ -945,4 +945,17 @@ public class OverlayPanel extends JPanel implements Listener<ChannelEvent>, ISou
     {
         ALL, ENABLED, NONE;
     }
+
+    /**
+     * Public accessor for the private {@code getAxisFromFrequency} method.
+     * Allows overlay components (e.g. {@link PendingClassificationOverlay}) to convert a
+     * frequency to a pixel x-coordinate using the same zoom/offset maths.
+     *
+     * @param frequency the frequency to convert
+     * @return pixel x-coordinate on this panel
+     */
+    public int getAxisFromFrequencyPublic(long frequency)
+    {
+        return (int) getAxisFromFrequency(frequency);
+    }
 }
