@@ -285,14 +285,13 @@ public class SDRTrunk implements Listener<TunerEvent>
                     @Override
                     public void showPending(long centerFreqHz, int widthHz)
                     {
-                        // The SpectralDisplayPanel's pending overlay handles this via its own callback.
-                        // No separate action needed here.
+                        mSpectralPanel.showPendingOverlay(centerFreqHz, widthHz);
                     }
 
                     @Override
                     public void clearPending()
                     {
-                        // The SpectralDisplayPanel's pending overlay clears itself on cancel/complete.
+                        mSpectralPanel.clearPendingOverlay();
                     }
 
                     @Override

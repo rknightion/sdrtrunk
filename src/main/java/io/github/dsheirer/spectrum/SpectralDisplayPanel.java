@@ -152,6 +152,34 @@ public class SpectralDisplayPanel extends JPanel
     }
 
     /**
+     * Shows the pending-classification overlay at the given span.
+     * Delegates to {@link PendingClassificationOverlay#setPending}.
+     * No-op if the overlay is not yet installed.
+     *
+     * @param centerFreqHz centre frequency of the probed span, in Hz
+     * @param widthHz      estimated width of the probed span, in Hz
+     */
+    public void showPendingOverlay(long centerFreqHz, int widthHz)
+    {
+        if(mPendingOverlay != null)
+        {
+            mPendingOverlay.setPending(centerFreqHz, widthHz, mOverlayPanel);
+        }
+    }
+
+    /**
+     * Clears the pending-classification overlay.
+     * No-op if the overlay is not yet installed.
+     */
+    public void clearPendingOverlay()
+    {
+        if(mPendingOverlay != null)
+        {
+            mPendingOverlay.clear();
+        }
+    }
+
+    /**
      * Wires in the click-to-tune controller and installs the pending-classification overlay
      * on the {@link JLayeredPane} above the overlay panel.
      *
@@ -729,11 +757,7 @@ public class SpectralDisplayPanel extends JPanel
                     long midHz = midpointFrequency(xLeft, xRight);
                     int  bwHz  = pixelSpanToHz(xLeft, xRight);
 
-                    if(mPendingOverlay != null)
-                    {
-                        mPendingOverlay.setPending(midHz, bwHz, mOverlayPanel);
-                    }
-
+                    // showPendingOverlay / clearPendingOverlay are called via UICallbacks
                     mClickToTuneController.classifyAndTune(midHz, bwHz);
                 }
             }
@@ -785,12 +809,7 @@ public class SpectralDisplayPanel extends JPanel
                 && event.getComponent() == mOverlayPanel)
             {
                 long freq = mOverlayPanel.getFrequencyFromAxis(event.getX());
-
-                if(mPendingOverlay != null)
-                {
-                    mPendingOverlay.setPending(freq, 0, mOverlayPanel);
-                }
-
+                // Pending overlay is shown via UICallbacks.showPending() inside classifyAndTune
                 mClickToTuneController.classifyAndTune(freq, 0);
                 return;
             }
@@ -852,14 +871,9 @@ public class SpectralDisplayPanel extends JPanel
                     {
                         JMenuItem autoDetect = new JMenuItem("Decode here (auto-detect)");
                         final long clickFreq = frequency;
-                        autoDetect.addActionListener(ev -> {
-                            if(mPendingOverlay != null)
-                            {
-                                mPendingOverlay.setPending(clickFreq, 0, mOverlayPanel);
-                            }
-
-                            mClickToTuneController.classifyAndTune(clickFreq, 0);
-                        });
+                        // Pending overlay is shown via UICallbacks.showPending() inside classifyAndTune
+                        autoDetect.addActionListener(ev ->
+                            mClickToTuneController.classifyAndTune(clickFreq, 0));
                         contextMenu.add(autoDetect);
 
                         JMenu decodeAsMenu = new JMenu("Decode here as ▸");
