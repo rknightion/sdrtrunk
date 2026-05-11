@@ -39,6 +39,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -135,55 +136,54 @@ public class SignalClassifier
     public CompletableFuture<ClassificationResult> classify(ClassificationRequest request)
     {
         AtomicBoolean cancelledFlag = new AtomicBoolean(false);
-        CompletableFuture<ClassificationResult> completable = new CompletableFuture<>();
 
-        // Submit work as a real Future so cancel() can interrupt the worker thread.
+        // Wrapper that overrides cancel() to interrupt the worker thread.
+        // Using AtomicReference so the inner class can assign workerFuture after construction.
+        AtomicReference<Future<?>> workerFutureRef = new AtomicReference<>();
+
+        CompletableFuture<ClassificationResult> wrapper = new CompletableFuture<ClassificationResult>()
+        {
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning)
+            {
+                cancelledFlag.set(true);
+                // Mark as cancelled BEFORE interrupting the worker so that when the
+                // worker thread calls wrapper.complete(result) after being interrupted,
+                // the future is already in the cancelled state and complete() is a no-op.
+                boolean cancelled = super.cancel(mayInterruptIfRunning);
+                Future<?> wf = workerFutureRef.get();
+                if(wf != null)
+                {
+                    wf.cancel(true); // interrupt the worker thread
+                }
+                return cancelled;
+            }
+        };
+
+        // Submit work as a real Future so we can interrupt it on cancel.
         Future<?> workerFuture = mExecutor.submit(() -> {
             try
             {
                 ClassificationResult result = doClassify(request, cancelledFlag);
-                completable.complete(result);
+                wrapper.complete(result); // no-op if wrapper was already cancelled
             }
             catch(Throwable t)
             {
                 // Belt-and-suspenders: doClassify wraps internally, but guard here too
                 mLog.error("Unexpected error in SignalClassifier worker", t);
-                completable.complete(ClassificationResult.error(request.centerFrequencyHz(), t.getMessage()));
+                wrapper.complete(ClassificationResult.error(request.centerFrequencyHz(), t.getMessage()));
             }
         });
 
-        // Wrap into a CompletableFuture whose cancel() propagates the interrupt.
-        completable.whenComplete((result, ex) -> {
-            // If the CompletableFuture is cancelled externally, cancel the underlying Future
-            // with interrupt=true so the worker thread wakes from sleep/wait calls.
-            if(completable.isCancelled())
-            {
-                cancelledFlag.set(true);
-                workerFuture.cancel(true);
-            }
-        });
+        workerFutureRef.set(workerFuture);
 
-        // Override cancel so the CompletableFuture.cancel() also triggers cleanup.
-        return new CompletableFuture<ClassificationResult>()
+        // If wrapper was cancelled before we set the reference, interrupt now.
+        if(wrapper.isCancelled())
         {
-            {
-                // Pipe completable into this future
-                completable.whenComplete((r, ex) -> {
-                    if(!isCancelled())
-                    {
-                        complete(r);
-                    }
-                });
-            }
+            workerFuture.cancel(true);
+        }
 
-            @Override
-            public boolean cancel(boolean mayInterruptIfRunning)
-            {
-                cancelledFlag.set(true);
-                workerFuture.cancel(true); // interrupt the thread
-                return super.cancel(mayInterruptIfRunning);
-            }
-        };
+        return wrapper;
     }
 
     // -------------------------------------------------------------------------
