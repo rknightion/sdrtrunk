@@ -32,9 +32,6 @@ import io.github.dsheirer.controller.channel.ChannelAutoStartFrame;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelSelectionManager;
 import io.github.dsheirer.controller.channel.map.ChannelMapModel;
-import io.github.dsheirer.module.discovery.ProbeChainFactory;
-import io.github.dsheirer.module.discovery.SignalClassifier;
-import io.github.dsheirer.module.discovery.SourceProvider;
 import io.github.dsheirer.eventbus.MyEventBus;
 import io.github.dsheirer.gui.icon.ViewIconManagerRequest;
 import io.github.dsheirer.gui.playlist.ViewPlaylistRequest;
@@ -46,6 +43,9 @@ import io.github.dsheirer.gui.viewer.ViewRecordingViewerRequest;
 import io.github.dsheirer.icon.IconModel;
 import io.github.dsheirer.log.ApplicationLog;
 import io.github.dsheirer.map.MapService;
+import io.github.dsheirer.module.discovery.ProbeChainFactory;
+import io.github.dsheirer.module.discovery.SignalClassifier;
+import io.github.dsheirer.module.discovery.SourceProvider;
 import io.github.dsheirer.module.log.EventLogManager;
 import io.github.dsheirer.monitor.DiagnosticMonitor;
 import io.github.dsheirer.monitor.ResourceMonitor;
@@ -55,6 +55,7 @@ import io.github.dsheirer.properties.SystemProperties;
 import io.github.dsheirer.record.AudioRecordingManager;
 import io.github.dsheirer.sample.Listener;
 import io.github.dsheirer.settings.SettingsManager;
+import io.github.dsheirer.source.ComplexSource;
 import io.github.dsheirer.source.tuner.Tuner;
 import io.github.dsheirer.source.tuner.TunerEvent;
 import io.github.dsheirer.source.tuner.manager.DiscoveredTuner;
@@ -66,11 +67,11 @@ import io.github.dsheirer.spectrum.ShowTunerMenuItem;
 import io.github.dsheirer.spectrum.SpectralDisplayPanel;
 import io.github.dsheirer.util.ThreadPool;
 import io.github.dsheirer.util.TimeStamp;
+import io.github.dsheirer.vector.calibrate.CalibrationManager;
+import java.awt.AWTException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import io.github.dsheirer.vector.calibrate.CalibrationManager;
-import java.awt.AWTException;
 import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.EventQueue;
@@ -214,7 +215,7 @@ public class SDRTrunk implements Listener<TunerEvent>
             return t;
         });
         SourceProvider sourceProvider = (config, spec, name) ->
-            (io.github.dsheirer.source.ComplexSource) mTunerManager.getSource(config, spec, name);
+            (ComplexSource) mTunerManager.getSource(config, spec, name);
         ProbeChainFactory probeChainFactory = new ProbeChainFactory(aliasModel,
             mPlaylistManager.getChannelMapModel(), mUserPreferences);
         mSignalClassifier = new SignalClassifier(sourceProvider, probeChainFactory,
@@ -674,14 +675,11 @@ public class SDRTrunk implements Listener<TunerEvent>
         mAudioRecordingManager.stop();
         mResourceMonitor.stop();
 
-        mLog.info("Stopping spectral display ...");
-        mSpectralPanel.clearTuner();
-        mLog.info("Stopping tuners ...");
-        mTunerManager.stop();
-        mLog.info("Stopping discovery executor ...");
-
+        // Shut down discovery executor BEFORE stopping the tuner manager so that any
+        // in-flight probes release their TunerChannelSources before the channelizers tear down.
         if(mDiscoveryExecutor != null)
         {
+            mLog.info("Stopping discovery executor ...");
             mDiscoveryExecutor.shutdownNow();
 
             try
@@ -693,6 +691,11 @@ public class SDRTrunk implements Listener<TunerEvent>
                 Thread.currentThread().interrupt();
             }
         }
+
+        mLog.info("Stopping spectral display ...");
+        mSpectralPanel.clearTuner();
+        mLog.info("Stopping tuners ...");
+        mTunerManager.stop();
 
         mLog.info("Shutdown complete.");
         mApplicationLog.stop();

@@ -76,7 +76,14 @@ public class ProbeChainFactory
      */
     public ProbeChain build(DecoderType decoderType)
     {
-        // Build a throwaway channel with the default decode configuration for this type
+        // Build a throwaway channel with the default decode configuration for this type.
+        //
+        // WHY ChannelType.STANDARD: DecoderFactory.getPrimaryModules() checks the ChannelType when
+        // the TrafficChannelManager parameter is null.  For TRAFFIC channels without a TCM, the
+        // factory skips adding the P25 P1 decoder state machine, which breaks lock detection.
+        // Using STANDARD ensures the full decoder stack is built.  The subsequent call to
+        // removeTrafficChannelManager() strips the otherwise-unused TCM module so the chain
+        // remains lightweight and produces no side effects.
         Channel channel = buildProbeChannel(decoderType);
 
         // Create the processing chain (auto-adds channel state, DecodeEventHistory, MessageHistory)

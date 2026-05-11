@@ -26,9 +26,27 @@ import io.github.dsheirer.module.decode.DecoderType;
  * associated {@link LockWatcher}, so the two can be managed together during probing.
  *
  * @param decoderType the protocol this chain is probing
- * @param chain       the probe chain (decoder-only; no audio/log/recorder modules)
- * @param lockWatcher the watcher observing this chain's decoder-state events
+ * @param chain       the probe chain (decoder-only; no audio/log/recorder modules); must not be null
+ * @param lockWatcher the watcher observing this chain's decoder-state events; must not be null
  */
 public record ProbeChain(DecoderType decoderType, ProcessingChain chain, LockWatcher lockWatcher)
 {
+    /**
+     * Compact constructor validating that neither {@code chain} nor {@code lockWatcher} is null.
+     */
+    public ProbeChain
+    {
+        if(decoderType == null)
+        {
+            throw new IllegalArgumentException("decoderType must not be null");
+        }
+        if(chain == null)
+        {
+            throw new IllegalArgumentException("chain must not be null");
+        }
+        if(lockWatcher == null)
+        {
+            throw new IllegalArgumentException("lockWatcher must not be null");
+        }
+    }
 }
