@@ -30,7 +30,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class SpectralDisplayPanelHelpersTest
 {
     // -------------------------------------------------------------------------
-    // isNonTrivialDrag (static, pure)
+    // isNonTrivialDrag (static, pure) — threshold is >= 10 pixels
     // -------------------------------------------------------------------------
 
     @Test
@@ -40,28 +40,28 @@ class SpectralDisplayPanelHelpersTest
     }
 
     @Test
-    void isNonTrivialDrag_twoPixels_false()
+    void isNonTrivialDrag_fivePixels_false()
     {
-        assertFalse(SpectralDisplayPanel.isNonTrivialDrag(100, 102));
+        assertFalse(SpectralDisplayPanel.isNonTrivialDrag(100, 105));
     }
 
     @Test
-    void isNonTrivialDrag_threePixels_false()
+    void isNonTrivialDrag_ninePixels_false()
     {
-        assertFalse(SpectralDisplayPanel.isNonTrivialDrag(100, 103));
+        assertFalse(SpectralDisplayPanel.isNonTrivialDrag(100, 109));
     }
 
     @Test
-    void isNonTrivialDrag_fourPixels_true()
+    void isNonTrivialDrag_tenPixels_true()
     {
-        assertTrue(SpectralDisplayPanel.isNonTrivialDrag(100, 104));
+        assertTrue(SpectralDisplayPanel.isNonTrivialDrag(100, 110));
     }
 
     @Test
     void isNonTrivialDrag_reversed_trueSameAsForward()
     {
         // The method should be symmetric (absolute value)
-        assertTrue(SpectralDisplayPanel.isNonTrivialDrag(104, 100));
+        assertTrue(SpectralDisplayPanel.isNonTrivialDrag(110, 100));
     }
 
     @Test

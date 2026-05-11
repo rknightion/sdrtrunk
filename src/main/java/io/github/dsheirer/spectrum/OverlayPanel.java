@@ -468,9 +468,13 @@ public class OverlayPanel extends JPanel implements Listener<ChannelEvent>, ISou
     }
 
     /**
-     * Returns the x-axis value corresponding to the frequency
+     * Returns the x-axis pixel value corresponding to the given frequency.
+     * The inverse operation is the already-public {@link #getFrequencyFromAxis(double)}.
+     *
+     * @param frequency the frequency to convert, in Hz
+     * @return pixel x-coordinate on this panel
      */
-    private double getAxisFromFrequency(long frequency)
+    public double getAxisFromFrequency(long frequency)
     {
         double screenWidth = (double)getSize().getWidth();
 
@@ -946,16 +950,4 @@ public class OverlayPanel extends JPanel implements Listener<ChannelEvent>, ISou
         ALL, ENABLED, NONE;
     }
 
-    /**
-     * Public accessor for the private {@code getAxisFromFrequency} method.
-     * Allows overlay components (e.g. {@link PendingClassificationOverlay}) to convert a
-     * frequency to a pixel x-coordinate using the same zoom/offset maths.
-     *
-     * @param frequency the frequency to convert
-     * @return pixel x-coordinate on this panel
-     */
-    public int getAxisFromFrequencyPublic(long frequency)
-    {
-        return (int) getAxisFromFrequency(frequency);
-    }
 }

@@ -618,16 +618,16 @@ public class SpectralDisplayPanel extends JPanel
     }
 
     /**
-     * Returns true if the given x-pixel range is "non-trivial" (> 3 pixels wide).
+     * Returns true if the given x-pixel range is "non-trivial" (>= 10 pixels wide).
      * Used to distinguish an intentional drag-select from an accidental mouse-jitter.
      *
      * @param xLeft  left pixel
      * @param xRight right pixel
-     * @return true if |xRight - xLeft| > 3
+     * @return true if |xRight - xLeft| >= 10
      */
     static boolean isNonTrivialDrag(int xLeft, int xRight)
     {
-        return Math.abs(xRight - xLeft) > 3;
+        return Math.abs(xRight - xLeft) >= 10;
     }
 
     /**
@@ -716,9 +716,11 @@ public class SpectralDisplayPanel extends JPanel
             mPixelsPerBin = (double)getWidth() / ((double)(mDFTSize.getSize()) / (double)getZoomMultiplier());
 
             // Start a Shift+drag selection if Shift is held AND left button pressed
+            // Gate on the overlay panel so waterfall coords don't mismatch spectrum coords
             if(SwingUtilities.isLeftMouseButton(e)
                 && (e.getModifiersEx() & InputEvent.SHIFT_DOWN_MASK) != 0
-                && mClickToTuneController != null)
+                && mClickToTuneController != null
+                && e.getComponent() == mOverlayPanel)
             {
                 mShiftDragActive = true;
                 mSelectionStartX  = e.getX();
@@ -842,7 +844,7 @@ public class SpectralDisplayPanel extends JPanel
                         if(mClickToTuneController != null
                             && mClickToTuneController.getClickToTuneChannels().contains(channel))
                         {
-                            JMenu changeDecoder = new JMenu("Change decoder ▸");
+                            JMenu changeDecoder = new JMenu("Change decoder");
                             for(DecoderType type : DecoderType.PRIMARY_DECODERS)
                             {
                                 JMenuItem decoderItem = new JMenuItem(type.getShortDisplayString());
@@ -876,7 +878,7 @@ public class SpectralDisplayPanel extends JPanel
                             mClickToTuneController.classifyAndTune(clickFreq, 0));
                         contextMenu.add(autoDetect);
 
-                        JMenu decodeAsMenu = new JMenu("Decode here as ▸");
+                        JMenu decodeAsMenu = new JMenu("Decode here as");
                         for(DecoderType type : DecoderType.PRIMARY_DECODERS)
                         {
                             final DecoderType dt = type;
@@ -1117,8 +1119,8 @@ public class SpectralDisplayPanel extends JPanel
                 g2.drawRect(mXLeft, 0, mXRight - mXLeft - 1, getHeight() - 1);
 
                 // Label: centre freq + width
-                String label = String.format("%.4f MHz  ±%d kHz",
-                    mMidHz / 1e6, mBwHz / 2_000);
+                String label = String.format(java.util.Locale.ROOT, "%.4f MHz  +/-%.1f kHz",
+                    mMidHz / 1e6, mBwHz / 2_000.0);
                 g2.setColor(new Color(255, 255, 200, 230));
                 g2.drawString(label, mXLeft + 4, 14);
             }

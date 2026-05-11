@@ -32,10 +32,8 @@ import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
+import java.util.Locale;
 import javax.swing.JComponent;
-import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,9 +45,12 @@ import org.slf4j.LoggerFactory;
  * <h3>Behaviour</h3>
  * <ul>
  *   <li>Shows a translucent rectangle at the target frequency span.</li>
- *   <li>Animates an "Identifying…" label cycling through decoder abbreviations.</li>
- *   <li>Clicking anywhere on the overlay or pressing <kbd>Esc</kbd> fires the
- *       cancel callback and clears the overlay.</li>
+ *   <li>Animates an "Identifying..." label cycling through decoder abbreviations.</li>
+ *   <li>Pressing <kbd>Esc</kbd> fires the cancel callback and clears the overlay.</li>
+ *   <li>The component is <em>non-interactive</em> for mouse events: it does not install a
+ *       {@code MouseListener} that would consume clicks or wheel-scroll.  Pan, zoom, and
+ *       right-click continue to work on the underlying panels while a classification is
+ *       pending.  Cancel is available via Esc (or the programmatic {@code cancelCallback}).</li>
  *   <li>{@link #setPending(long, int, OverlayPanel)} starts / replaces the animation;
  *       {@link #clear()} hides it.</li>
  * </ul>
@@ -69,9 +70,9 @@ public class PendingClassificationOverlay extends JComponent
     private static final float ALPHA  = 0.75f;
     private static final int   CORNER = 4;
 
-    private static final String[] SPINNER_FRAMES = {"  ●○○○ ", " ○●○○ ", " ○○●○ ", " ○○○● "};
+    private static final String[] SPINNER_FRAMES = {"  ***  ", " .**.  ", " ..*.. ", " ...*. "};
     private static final String[] DECODER_HINTS  =
-        {"DMR?", "P25-1?", "P25-2?", "NBFM?", "AM?", "LTR?", "MPT?", "Passport?"};
+        {"DMR?", "P25-1?", "P25-2?", "NBFM?", "AM?", "LTR?", "LTR-Net?", "MPT?", "Passport?"};
 
     /** Repaint interval in ms — fast enough for a smooth spinner. */
     private static final int TIMER_INTERVAL_MS = 250;
@@ -81,7 +82,7 @@ public class PendingClassificationOverlay extends JComponent
     private long mCenterFreqHz;
     private int mWidthHz;
 
-    /** The OverlayPanel used to convert frequency ↔ pixel-x. */
+    /** The OverlayPanel used to convert frequency to pixel-x. */
     private OverlayPanel mOverlayPanel;
 
     private boolean mActive;
@@ -101,6 +102,10 @@ public class PendingClassificationOverlay extends JComponent
      * the {@link javax.swing.JLayeredPane#PALETTE_LAYER} above the
      * {@link OverlayPanel}.</p>
      *
+     * <p>This component intentionally does NOT install a mouse listener.  Mouse
+     * events (pan, zoom, right-click) pass through to the underlying panels.
+     * Cancel is available via the Esc key binding.</p>
+     *
      * @param cancelCallback invoked (on the EDT) when the user cancels the pending classification
      */
     public PendingClassificationOverlay(Runnable cancelCallback)
@@ -109,17 +114,7 @@ public class PendingClassificationOverlay extends JComponent
         setOpaque(false);
         setVisible(false);
 
-        // Click anywhere on this overlay → cancel
-        addMouseListener(new MouseAdapter()
-        {
-            @Override
-            public void mouseClicked(MouseEvent e)
-            {
-                cancel();
-            }
-        });
-
-        // Esc key → cancel  (component must have focus for key events)
+        // Esc key -> cancel (component must have focus for key events)
         addKeyListener(new KeyAdapter()
         {
             @Override
@@ -154,7 +149,7 @@ public class PendingClassificationOverlay extends JComponent
      * Starts (or replaces) the pending-classification display.
      *
      * @param centerFreqHz centre frequency of the signal being probed, in Hz
-     * @param widthHz      width of the probed span, in Hz (≥ 0)
+     * @param widthHz      width of the probed span, in Hz (>= 0)
      * @param overlayPanel the overlay panel used to map frequency to pixel position
      */
     public void setPending(long centerFreqHz, int widthHz, OverlayPanel overlayPanel)
@@ -208,8 +203,8 @@ public class PendingClassificationOverlay extends JComponent
             long minFreq   = mCenterFreqHz - halfWidth;
             long maxFreq   = mCenterFreqHz + halfWidth;
 
-            int xLeft  = mOverlayPanel.getAxisFromFrequencyPublic(minFreq);
-            int xRight = mOverlayPanel.getAxisFromFrequencyPublic(maxFreq);
+            int xLeft  = (int) mOverlayPanel.getAxisFromFrequency(minFreq);
+            int xRight = (int) mOverlayPanel.getAxisFromFrequency(maxFreq);
 
             // Ensure at least a few pixels wide so it's always visible
             if(xRight - xLeft < 4)
@@ -245,7 +240,7 @@ public class PendingClassificationOverlay extends JComponent
             // --- animated label -------------------------------------------------
             String spinnerFrame = SPINNER_FRAMES[mAnimFrame % SPINNER_FRAMES.length];
             String decoderHint  = DECODER_HINTS[(mAnimFrame / 2) % DECODER_HINTS.length];
-            String label        = "Identifying… " + decoderHint + " " + spinnerFrame;
+            String label        = String.format(Locale.ROOT, "Identifying... %s %s", decoderHint, spinnerFrame);
 
             Font font = g2.getFont().deriveFont(Font.BOLD, 11f);
             g2.setFont(font);
