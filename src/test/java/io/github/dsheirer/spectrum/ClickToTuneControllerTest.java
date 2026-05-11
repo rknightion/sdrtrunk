@@ -20,18 +20,19 @@ package io.github.dsheirer.spectrum;
 
 import io.github.dsheirer.alias.AliasModel;
 import io.github.dsheirer.controller.channel.Channel;
+import io.github.dsheirer.controller.channel.ChannelEvent;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
 import io.github.dsheirer.module.decode.DecoderFactory;
 import io.github.dsheirer.module.decode.DecoderType;
+import io.github.dsheirer.module.discovery.Candidate;
 import io.github.dsheirer.module.discovery.ClassificationOutcome;
 import io.github.dsheirer.module.discovery.ClassificationResult;
 import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
 import io.github.dsheirer.module.discovery.LockState;
 import io.github.dsheirer.module.discovery.SignalClassifier;
 import io.github.dsheirer.module.discovery.SignalKind;
-import io.github.dsheirer.module.discovery.Candidate;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.source.config.SourceConfigTuner;
 import java.util.ArrayList;
@@ -122,6 +123,16 @@ class ClickToTuneControllerTest
         {
             mRemoved.add(channel);
             super.removeChannel(channel);
+        }
+
+        /**
+         * Simulates the user deleting a channel (e.g. via the playlist editor).
+         * Calls {@link #removeChannel(Channel)} which triggers the underlying list-change
+         * listener and broadcasts a NOTIFICATION_DELETE event to all registered listeners.
+         */
+        void simulateUserDelete(Channel channel)
+        {
+            removeChannel(channel);
         }
     }
 
@@ -334,7 +345,7 @@ class ClickToTuneControllerTest
     @Test
     void missPopup_keepListeningCallback_reclassifies() throws Exception
     {
-        // First call: no signal → miss popup shown
+        // First call: no signal -> miss popup shown
         mFakeClassifier.setNextResult(ClassificationResult.noSignal(FREQ, Double.NaN));
         mController.classifyAndTune(FREQ, 12_500);
         drainEdt();
@@ -376,31 +387,230 @@ class ClickToTuneControllerTest
         assertEquals(DecoderType.DMR, mFakeChannelModel.mAdded.get(0).getDecodeConfiguration().getDecoderType());
     }
 
+    // -------------------------------------------------------------------------
+    // Fix #1: changeDecoder must NOT re-add the channel to the model
+    // -------------------------------------------------------------------------
+
+    @Test
+    void changeDecoder_doesNotReAddChannelToModel() throws Exception
+    {
+        // Create a click-to-tune channel via classifyAndTune
+        mFakeClassifier.setNextResult(ClassificationResult.identified(
+            FREQ,
+            List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
+            DecoderType.NBFM,
+            DecoderFactory.getDecodeConfiguration(DecoderType.NBFM),
+            SignalKind.CONVENTIONAL, "", Map.of(), -80.0
+        ));
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        assertEquals(1, mFakeChannelModel.mAdded.size(), "Initially one channel in model");
+        Channel channel = mFakeChannelModel.mAdded.get(0);
+
+        // Change decoder -- must NOT add to model again
+        mController.changeDecoder(channel, DecoderType.DMR);
+
+        assertEquals(1, mFakeChannelModel.mAdded.size(),
+            "Model size must not grow on changeDecoder (no duplicate add)");
+        assertEquals(0, mFakeChannelModel.mRemoved.size(),
+            "Channel must not be removed from model on changeDecoder");
+        assertEquals(1, mFakeCpm.mStopped.size(), "Channel should be stopped before decoder change");
+        assertEquals(2, mFakeCpm.mStarted.size(), "Channel should be restarted (2 starts total)");
+        assertEquals(DecoderType.DMR, channel.getDecodeConfiguration().getDecoderType(),
+            "Decoder type should be updated");
+        assertTrue(mController.getClickToTuneChannels().contains(channel),
+            "Channel should remain in click-to-tune set");
+    }
+
     @Test
     void changeDecoder_stopsAndRestartsWithNewDecoder() throws Exception
     {
-        // First, create a click-to-tune channel
-        ClassificationResult identified = ClassificationResult.identified(
+        mFakeClassifier.setNextResult(ClassificationResult.identified(
+            FREQ,
+            List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
+            DecoderType.NBFM,
+            DecoderFactory.getDecodeConfiguration(DecoderType.NBFM),
+            SignalKind.CONVENTIONAL, "", Map.of(), -80.0
+        ));
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        Channel channel = mFakeChannelModel.mAdded.get(0);
+
+        mController.changeDecoder(channel, DecoderType.DMR);
+
+        assertEquals(1, mFakeCpm.mStopped.size(), "Channel should be stopped before decoder change");
+        assertEquals(2, mFakeCpm.mStarted.size(), "Channel should be restarted with new decoder");
+        assertEquals(DecoderType.DMR, channel.getDecodeConfiguration().getDecoderType(),
+            "Channel decode config should be updated to DMR");
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix #2: redetect must operate on the existing channel, not orphan it
+    // -------------------------------------------------------------------------
+
+    @Test
+    void redetect_identified_swapsConfigAndRestartsExistingChannel() throws Exception
+    {
+        // Create a channel with NBFM
+        mFakeClassifier.setNextResult(ClassificationResult.identified(
+            FREQ,
+            List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
+            DecoderType.NBFM,
+            DecoderFactory.getDecodeConfiguration(DecoderType.NBFM),
+            SignalKind.CONVENTIONAL, "", Map.of(), -80.0
+        ));
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        assertEquals(1, mFakeChannelModel.mAdded.size());
+        Channel channel = mFakeChannelModel.mAdded.get(0);
+        assertEquals(DecoderType.NBFM, channel.getDecodeConfiguration().getDecoderType());
+
+        // Re-detect: classifier now returns DMR
+        mFakeClassifier.setNextResult(ClassificationResult.identified(
+            FREQ,
+            List.of(new Candidate(DecoderType.DMR, LockState.LOCKED, 0.95, null)),
+            DecoderType.DMR,
+            DecoderFactory.getDecodeConfiguration(DecoderType.DMR),
+            SignalKind.CONTROL, "", Map.of(), -65.0
+        ));
+        mController.redetect(channel);
+        drainEdt();
+
+        // Model must still have exactly 1 channel -- the original one
+        assertEquals(1, mFakeChannelModel.mAdded.size(),
+            "redetect must NOT add a new channel to the model");
+        assertEquals(0, mFakeChannelModel.mRemoved.size(),
+            "redetect must NOT remove the existing channel");
+        assertSame(channel, mFakeChannelModel.mAdded.get(0),
+            "The existing channel object must be reused");
+
+        // Config should be updated to DMR
+        assertEquals(DecoderType.DMR, channel.getDecodeConfiguration().getDecoderType(),
+            "Channel decoder should be updated to DMR after successful re-detect");
+
+        // Channel should have been restarted (1 start from classifyAndTune + 1 from redetect)
+        assertEquals(2, mFakeCpm.mStarted.size(), "Channel should be restarted after re-detect");
+        assertTrue(mController.getClickToTuneChannels().contains(channel));
+    }
+
+    @Test
+    void redetect_miss_leavesChannelIntact() throws Exception
+    {
+        // Create a channel with NBFM
+        mFakeClassifier.setNextResult(ClassificationResult.identified(
+            FREQ,
+            List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
+            DecoderType.NBFM,
+            DecoderFactory.getDecodeConfiguration(DecoderType.NBFM),
+            SignalKind.CONVENTIONAL, "", Map.of(), -80.0
+        ));
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        Channel channel = mFakeChannelModel.mAdded.get(0);
+
+        // Re-detect: no signal
+        mFakeClassifier.setNextResult(ClassificationResult.noSignal(FREQ, Double.NaN));
+        mController.redetect(channel);
+        drainEdt();
+
+        // Model must still have exactly 1 channel
+        assertEquals(1, mFakeChannelModel.mAdded.size(),
+            "redetect miss must NOT add a new channel");
+        assertEquals(0, mFakeChannelModel.mRemoved.size(),
+            "redetect miss must NOT remove the existing channel");
+        assertSame(channel, mFakeChannelModel.mAdded.get(0));
+
+        // The miss popup should be shown with the miss result
+        assertNotNull(mFakeUI.mMissResult, "Miss popup should be shown after no-signal re-detect");
+        assertEquals(ClassificationOutcome.NO_SIGNAL, mFakeUI.mMissResult.outcome());
+
+        // Channel should have been restarted even on miss (restored to original running state)
+        // 1 start from classifyAndTune + 1 restart from redetect miss path
+        assertEquals(2, mFakeCpm.mStarted.size(), "Channel should be restarted after re-detect miss");
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix #3: overlapping classifications
+    // -------------------------------------------------------------------------
+
+    @Test
+    void classifyAndTune_overlapping_onlyOneChannelCreated() throws Exception
+    {
+        // First call: use a never-completing future
+        CompletableFuture<ClassificationResult> firstFuture = new CompletableFuture<>();
+        mFakeClassifier.setNextResult(firstFuture);
+        mController.classifyAndTune(FREQ, 12_500);
+
+        // Second call before first completes -- should cancel the first
+        ClassificationResult secondResult = ClassificationResult.identified(
             FREQ,
             List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
             DecoderType.NBFM,
             DecoderFactory.getDecodeConfiguration(DecoderType.NBFM),
             SignalKind.CONVENTIONAL, "", Map.of(), -80.0
         );
-        mFakeClassifier.setNextResult(identified);
+        mFakeClassifier.setNextResult(secondResult);
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        // First future should have been cancelled
+        assertTrue(firstFuture.isCancelled(), "First pending future should have been cancelled");
+
+        // Exactly one channel should be created (from the second call)
+        assertEquals(1, mFakeChannelModel.mAdded.size(),
+            "Exactly one channel should be created when two calls overlap");
+        assertEquals(1, mFakeCpm.mStarted.size());
+    }
+
+    @Test
+    void classifyAndTune_overlapping_overlayEndsCleared() throws Exception
+    {
+        // First call: never-completing
+        CompletableFuture<ClassificationResult> firstFuture = new CompletableFuture<>();
+        mFakeClassifier.setNextResult(firstFuture);
+        mController.classifyAndTune(FREQ, 12_500);
+
+        // Second call: immediate result
+        ClassificationResult noSignal = ClassificationResult.noSignal(FREQ, Double.NaN);
+        mFakeClassifier.setNextResult(noSignal);
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        // The overlay should be cleared after the second call's result
+        assertTrue(mFakeUI.mPendingCleared, "Pending overlay should be cleared after second call completes");
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix #6: pruning mClickToTuneChannels on channel removal
+    // -------------------------------------------------------------------------
+
+    @Test
+    void channelRemoved_prunedFromClickToTuneSet() throws Exception
+    {
+        // Create a channel
+        mFakeClassifier.setNextResult(ClassificationResult.identified(
+            FREQ,
+            List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
+            DecoderType.NBFM,
+            DecoderFactory.getDecodeConfiguration(DecoderType.NBFM),
+            SignalKind.CONVENTIONAL, "", Map.of(), -80.0
+        ));
         mController.classifyAndTune(FREQ, 12_500);
         drainEdt();
 
         Channel channel = mFakeChannelModel.mAdded.get(0);
+        assertTrue(mController.getClickToTuneChannels().contains(channel),
+            "Channel should be in click-to-tune set after creation");
 
-        // Now change decoder
-        mController.changeDecoder(channel, DecoderType.DMR);
+        // Simulate deletion via ChannelModel (e.g. user removes channel in playlist editor)
+        mFakeChannelModel.simulateUserDelete(channel);
 
-        assertEquals(1, mFakeCpm.mStopped.size(), "Channel should be stopped before decoder change");
-        // After changeDecoder, start is called again → 2 starts total (1 from classifyAndTune, 1 from changeDecoder)
-        assertEquals(2, mFakeCpm.mStarted.size(), "Channel should be restarted with new decoder");
-        assertEquals(DecoderType.DMR, channel.getDecodeConfiguration().getDecoderType(),
-            "Channel decode config should be updated to DMR");
+        assertFalse(mController.getClickToTuneChannels().contains(channel),
+            "Channel should be removed from click-to-tune set when deleted from model");
     }
 
     @Test

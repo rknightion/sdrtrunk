@@ -20,9 +20,9 @@ package io.github.dsheirer.spectrum;
 
 import io.github.dsheirer.controller.channel.Channel;
 import io.github.dsheirer.controller.channel.ChannelException;
+import io.github.dsheirer.controller.channel.ChannelEvent;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
-import io.github.dsheirer.controller.channel.event.ChannelStartProcessingRequest;
 import io.github.dsheirer.module.decode.DecoderFactory;
 import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.module.discovery.ClassificationOutcome;
@@ -31,8 +31,11 @@ import io.github.dsheirer.module.discovery.ClassificationResult;
 import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
 import io.github.dsheirer.module.discovery.SignalClassifier;
 import io.github.dsheirer.preference.UserPreferences;
+import io.github.dsheirer.source.config.SourceConfigTuner;
 import java.util.Collections;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
@@ -85,6 +88,9 @@ public class ClickToTuneController
     /**
      * Reference to the currently in-progress classification future, so the pending overlay
      * cancel button can call {@code future.cancel(true)}.
+     *
+     * <p>Guards against overlapping classifications: if a new call to {@link #classifyAndTune}
+     * arrives while one is in flight, the prior future is cancelled first.</p>
      */
     private final AtomicReference<CompletableFuture<ClassificationResult>> mPendingFuture =
         new AtomicReference<>();
@@ -159,6 +165,11 @@ public class ClickToTuneController
         mChannelFactory = channelFactory;
         mUserPreferences = userPreferences;
         mUICallbacks = uiCallbacks;
+
+        // Subscribe to channel-removal events so we prune mClickToTuneChannels
+        // and avoid unbounded growth if the user deletes a click-to-tune channel
+        // via the playlist editor.
+        mChannelModel.addListener(this::onChannelEvent);
     }
 
     // -------------------------------------------------------------------------
@@ -168,6 +179,8 @@ public class ClickToTuneController
     /**
      * Starts an auto-detection classification at the given frequency, shows the pending overlay,
      * and on success creates and starts a channel.
+     *
+     * <p>If a classification is already in flight it is cancelled before the new one begins.</p>
      *
      * <p>May be called from the EDT; all result handling is marshalled onto the EDT via
      * {@code SwingUtilities.invokeLater}.</p>
@@ -180,15 +193,34 @@ public class ClickToTuneController
         int bwHz = (approxBwHz > 0) ? approxBwHz
             : mUserPreferences.getDiscoveryPreference().getClickDefaultBandwidthHz();
 
+        // Cancel any in-progress classification before starting a new one
+        CompletableFuture<ClassificationResult> prior = mPendingFuture.getAndSet(null);
+        if(prior != null)
+        {
+            prior.cancel(true);
+        }
+
         mUICallbacks.showPending(centerFreqHz, bwHz);
 
         ClassificationRequest request = ClassificationRequest.forFrequency(centerFreqHz, bwHz,
             "click-to-tune@" + centerFreqHz);
 
         CompletableFuture<ClassificationResult> future = mSignalClassifier.classify(request);
+
+        // Only proceed with this result if this is still the current pending future
         mPendingFuture.set(future);
 
-        future.whenComplete((result, ex) -> SwingUtilities.invokeLater(() -> handleResult(result, ex)));
+        future.whenComplete((result, ex) -> SwingUtilities.invokeLater(() ->
+        {
+            // Guard: only handle this result if it's still the current future
+            if(!mPendingFuture.compareAndSet(future, null))
+            {
+                // A newer classification replaced us; silently discard this result
+                return;
+            }
+
+            handleResult(result, ex);
+        }));
     }
 
     /**
@@ -207,7 +239,7 @@ public class ClickToTuneController
     /**
      * Skips the classifier and immediately creates a channel with the chosen decoder.
      *
-     * <p>Used by the "Decode here as ▸ X" context-menu items.</p>
+     * <p>Used by the "Decode here as X" context-menu items.</p>
      *
      * @param freqHz    centre frequency, in Hz
      * @param type      decoder type to use
@@ -216,12 +248,16 @@ public class ClickToTuneController
     {
         String aliasList = defaultAliasListName();
         Channel channel = mChannelFactory.createChannel(freqHz, type, aliasList);
-        startChannel(channel);
+        startNewChannel(channel);
     }
 
     /**
-     * Changes the decoder on a click-to-tune channel: stops it, swaps the decode config,
-     * preserves frequency / name / alias list, and restarts it.
+     * Changes the decoder on an existing click-to-tune channel: stops it, swaps the decode
+     * config, preserves frequency / name / alias list, and restarts it.
+     *
+     * <p>This is the <em>restart</em> path — the channel is already in the model and must
+     * NOT be re-added.  Only {@link ChannelProcessingManager#start(Channel)} is called;
+     * {@link ChannelModel#addChannel(Channel)} is never called here.</p>
      *
      * @param channel   a click-to-tune channel (must be in {@link #mClickToTuneChannels})
      * @param newType   the desired decoder
@@ -246,16 +282,18 @@ public class ClickToTuneController
 
         channel.setDecodeConfiguration(DecoderFactory.getDecodeConfiguration(newType));
 
-        // Re-add to the click-to-tune set (stop removed nothing, but defensive)
-        mClickToTuneChannels.add(channel);
-
-        startChannel(channel);
+        // Restart the existing channel — do NOT add it to the model again
+        restartExistingChannel(channel);
     }
 
     /**
      * Re-classifies the signal for an existing click-to-tune channel.
-     * Stops the channel, runs the classifier at its frequency, then either restarts with the
-     * new decoder or falls back to the current decoder on miss.
+     *
+     * <p>Stops the channel and runs the classifier at its frequency.  On
+     * {@link ClassificationOutcome#IDENTIFIED} the existing channel's decode configuration
+     * is swapped to the winning decoder and the channel is restarted (no model mutation).
+     * On any other outcome the channel is left in its pre-redetect state (decode config
+     * unchanged) and the miss popup is shown.</p>
      *
      * @param channel a click-to-tune channel
      */
@@ -285,13 +323,79 @@ public class ClickToTuneController
             mLog.warn("Error stopping channel '{}' before re-detect: {}", channel.getName(), e.getMessage());
         }
 
-        // Re-classify at the same frequency; use the current bandwidth as a hint
-        classifyAndTune(freqHz, 0);
+        // Cancel any prior pending classification and start a new one for this channel
+        CompletableFuture<ClassificationResult> prior = mPendingFuture.getAndSet(null);
+        if(prior != null)
+        {
+            prior.cancel(true);
+        }
+
+        int bwHz = mUserPreferences.getDiscoveryPreference().getClickDefaultBandwidthHz();
+        mUICallbacks.showPending(freqHz, bwHz);
+
+        ClassificationRequest request = ClassificationRequest.forFrequency(freqHz, bwHz,
+            "redetect@" + freqHz);
+
+        CompletableFuture<ClassificationResult> future = mSignalClassifier.classify(request);
+        mPendingFuture.set(future);
+
+        future.whenComplete((result, ex) -> SwingUtilities.invokeLater(() ->
+        {
+            if(!mPendingFuture.compareAndSet(future, null))
+            {
+                return;
+            }
+
+            mUICallbacks.clearPending();
+
+            if(ex instanceof CancellationException)
+            {
+                // User cancelled — restore the channel with its original config
+                restartExistingChannel(channel);
+                return;
+            }
+
+            if(ex != null)
+            {
+                mLog.error("Unexpected exception during re-detect classification", ex);
+                restartExistingChannel(channel);
+                return;
+            }
+
+            if(result == null)
+            {
+                mLog.warn("Re-detect classification completed with null result");
+                restartExistingChannel(channel);
+                return;
+            }
+
+            if(result.outcome() == ClassificationOutcome.IDENTIFIED)
+            {
+                // Swap the existing channel's config and restart it — no model change
+                channel.setDecodeConfiguration(DecoderFactory.getDecodeConfiguration(result.bestDecoder()));
+                mClickToTuneChannels.add(channel); // defensive, should already be there
+                restartExistingChannel(channel);
+            }
+            else
+            {
+                // Miss — restore the channel and show the miss popup
+                restartExistingChannel(channel);
+                mUICallbacks.showMissPopup(
+                    result,
+                    () -> redetect(channel),
+                    type ->
+                    {
+                        channel.setDecodeConfiguration(DecoderFactory.getDecodeConfiguration(type));
+                        restartExistingChannel(channel);
+                    }
+                );
+            }
+        }));
     }
 
     /**
      * Returns an unmodifiable view of the channels created by this controller.
-     * The {@link DecoderOverrideChip} / context-menu logic uses this to know which channels are "ours".
+     * The decoder-override context-menu logic uses this to know which channels are "ours".
      *
      * @return set of click-to-tune channels
      */
@@ -305,11 +409,18 @@ public class ClickToTuneController
     // -------------------------------------------------------------------------
 
     /**
-     * Handles a completed classification result.  Always called on the EDT.
+     * Handles a completed classification result for {@link #classifyAndTune}.
+     * Always called on the EDT.
      */
     private void handleResult(ClassificationResult result, Throwable ex)
     {
         mUICallbacks.clearPending();
+
+        if(ex instanceof CancellationException)
+        {
+            // User-initiated cancel — no popup, no error log
+            return;
+        }
 
         if(ex != null)
         {
@@ -340,23 +451,28 @@ public class ClickToTuneController
     }
 
     /**
-     * Builds and starts a channel from a successful classification.  Called on the EDT.
+     * Builds and starts a brand-new channel from a successful classification.
+     * Called on the EDT.
      */
     private void handleIdentified(ClassificationResult result)
     {
         String aliasList = defaultAliasListName();
 
         Channel channel = mChannelFactory.createChannel(result, aliasList);
-        startChannel(channel);
+        startNewChannel(channel);
     }
 
     /**
-     * Adds the channel to the model and starts it.  On {@link ChannelException} removes
-     * the channel from the model and reports the failure via {@link UICallbacks#reportStartFailure}.
+     * Adds a brand-new channel to the model and starts it.
      *
-     * @param channel the channel to start
+     * <p>This is the <em>new channel</em> path: the channel is added to
+     * {@link ChannelModel} AND to {@link #mClickToTuneChannels}, then started.
+     * On {@link ChannelException} the channel is removed from both and the failure
+     * is reported via {@link UICallbacks#reportStartFailure}.</p>
+     *
+     * @param channel the new channel to add and start
      */
-    private void startChannel(Channel channel)
+    private void startNewChannel(Channel channel)
     {
         mChannelModel.addChannel(channel);
         mClickToTuneChannels.add(channel);
@@ -370,7 +486,47 @@ public class ClickToTuneController
             mLog.warn("Failed to start click-to-tune channel '{}': {}", channel.getName(), ce.getMessage());
             mClickToTuneChannels.remove(channel);
             mChannelModel.removeChannel(channel);
-            mUICallbacks.reportStartFailure(channel, ce.getMessage());
+            mUICallbacks.reportStartFailure(channel,
+                java.util.Objects.requireNonNullElse(ce.getMessage(), ce.toString()));
+        }
+    }
+
+    /**
+     * Restarts an <em>existing</em> channel that is already present in the model.
+     *
+     * <p>This is the <em>restart</em> path used by {@link #changeDecoder} and
+     * {@link #redetect}: the channel is NOT re-added to the model; only
+     * {@link ChannelProcessingManager#start(Channel)} is called.</p>
+     *
+     * @param channel the existing channel to restart
+     */
+    private void restartExistingChannel(Channel channel)
+    {
+        mClickToTuneChannels.add(channel); // defensive
+
+        try
+        {
+            mChannelProcessingManager.start(channel);
+        }
+        catch(ChannelException ce)
+        {
+            mLog.warn("Failed to restart click-to-tune channel '{}': {}", channel.getName(), ce.getMessage());
+            mUICallbacks.reportStartFailure(channel,
+                java.util.Objects.requireNonNullElse(ce.getMessage(), ce.toString()));
+        }
+    }
+
+    /**
+     * Receives channel events from the model and prunes channels that have been
+     * deleted (e.g. by the user via the playlist editor) from {@link #mClickToTuneChannels}.
+     *
+     * @param event the channel event
+     */
+    private void onChannelEvent(ChannelEvent event)
+    {
+        if(event.getEvent() == ChannelEvent.Event.NOTIFICATION_DELETE)
+        {
+            mClickToTuneChannels.remove(event.getChannel());
         }
     }
 
@@ -380,7 +536,7 @@ public class ClickToTuneController
      */
     private String defaultAliasListName()
     {
-        java.util.List<String> names = mChannelModel.getAliasListNames();
+        List<String> names = mChannelModel.getAliasListNames();
         return (names != null && !names.isEmpty()) ? names.get(0) : null;
     }
 
@@ -392,7 +548,7 @@ public class ClickToTuneController
      */
     private static long channelFrequency(Channel channel)
     {
-        if(channel.getSourceConfiguration() instanceof io.github.dsheirer.source.config.SourceConfigTuner sc)
+        if(channel.getSourceConfiguration() instanceof SourceConfigTuner sc)
         {
             return sc.getFrequency();
         }
