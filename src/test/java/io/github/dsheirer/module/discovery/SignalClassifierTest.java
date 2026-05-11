@@ -208,15 +208,20 @@ class SignalClassifierTest
             LockWatcher watcher = new LockWatcher();
             CountingChain chain = new CountingChain();
 
-            // Pre-feed events so the watcher already has the scripted state
+            // Pre-feed events so the watcher already has the scripted state.
+            // LOCKED requires both count debounce AND time debounce (LockWatcher.LOCK_DEBOUNCE_MS).
             if(targetState == LockState.LOCKED)
             {
                 State reportState = (kind == SignalKind.CONTROL) ? State.CONTROL : State.CALL;
-                for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT + 1; i++)
+                for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT - 1; i++)
                 {
                     watcher.getDecoderStateListener().receive(
                         new DecoderStateEvent(this, DecoderStateEvent.Event.NOTIFICATION_CHANNEL_STATE, reportState));
                 }
+                // Sleep past the time gate before sending the final event
+                try { Thread.sleep(LockWatcher.LOCK_DEBOUNCE_MS + 50); } catch(InterruptedException e) { Thread.currentThread().interrupt(); }
+                watcher.getDecoderStateListener().receive(
+                    new DecoderStateEvent(this, DecoderStateEvent.Event.NOTIFICATION_CHANNEL_STATE, reportState));
             }
             else if(targetState == LockState.PARTIAL)
             {
@@ -696,5 +701,249 @@ class SignalClassifierTest
             "for 12500 Hz bandwidth, P25_PHASE1 should be tried first and win");
 
         assertTrue(fakeSource.mStopped.get(), "source must be stopped");
+    }
+
+    // =========================================================================
+    // Fix #1: Bounded concurrent probing — N chains run at once
+    // =========================================================================
+
+    /**
+     * A factory that records at what time each probe chain's build() was called,
+     * so the test can verify that up to N chains were built without waiting for
+     * prior chains to complete.
+     *
+     * <p>Chains never lock (watcher stays NONE) so the full probe window is consumed.</p>
+     */
+    static class ConcurrencyRecordingFactory extends ProbeChainFactory
+    {
+        final AtomicInteger mMaxConcurrentSeen = new AtomicInteger(0);
+        final AtomicInteger mCurrentlyRunning  = new AtomicInteger(0);
+        final List<DecoderType> mBuildOrder = new ArrayList<>();
+
+        ConcurrencyRecordingFactory()
+        {
+            super(new AliasModel(), new ChannelMapModel(), new UserPreferences());
+        }
+
+        @Override
+        public ProbeChain build(DecoderType decoderType)
+        {
+            synchronized(mBuildOrder) { mBuildOrder.add(decoderType); }
+            LockWatcher watcher = new LockWatcher(); // stays NONE
+            CountingChain chain = new CountingChain()
+            {
+                @Override public void start()
+                {
+                    int running = mCurrentlyRunning.incrementAndGet();
+                    mMaxConcurrentSeen.accumulateAndGet(running, Math::max);
+                }
+                @Override public void stop() { mCurrentlyRunning.decrementAndGet(); super.stop(); }
+            };
+            return new ProbeChain(decoderType, chain, watcher);
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void classify_withMaxConcurrentProbes2_launchesTwoChainsSimultaneously() throws Exception
+    {
+        FakeComplexSource fakeSource = new FakeComplexSource();
+        ConcurrencyRecordingFactory factory = new ConcurrencyRecordingFactory();
+        SourceProvider provider = (config, spec, name) -> fakeSource;
+
+        // Fast windows so the test doesn't take long, max 2 concurrent
+        DiscoveryPreference prefs = new DiscoveryPreference(t -> {})
+        {
+            @Override public int getMaxConcurrentProbes() { return 2; }
+            @Override public Duration probeWindow(DecoderType dt) { return Duration.ofMillis(200); }
+        };
+
+        SignalClassifier classifier = new SignalClassifier(provider, factory, prefs, mExecutor);
+
+        ClassificationRequest request = new ClassificationRequest(
+            FREQ, 12500,
+            EnumSet.of(DecoderType.P25_PHASE1, DecoderType.DMR, DecoderType.NBFM),
+            Duration.ofSeconds(10),
+            false,
+            "concurrency-test"
+        );
+
+        ClassificationResult result = classifier.classify(request).get();
+
+        // All 3 decoders should have been tried
+        assertEquals(3, factory.mBuildOrder.size(),
+            "all 3 decoders should have been built");
+        // At some point, at least 2 chains were running concurrently
+        assertTrue(factory.mMaxConcurrentSeen.get() >= 2,
+            "at least 2 chains should have run concurrently, got: " + factory.mMaxConcurrentSeen.get());
+        assertTrue(fakeSource.mStopped.get(), "source must be stopped");
+        // With no locks, result should be UNIDENTIFIED
+        assertEquals(ClassificationOutcome.UNIDENTIFIED, result.outcome());
+    }
+
+    // =========================================================================
+    // Fix #2: Real cancel — propagates interrupt, result is CANCELLED
+    // =========================================================================
+
+    /**
+     * A source that blocks in start() long enough for the test to cancel the future.
+     */
+    static class LongBlockingComplexSource extends ComplexSource
+    {
+        private Listener<ComplexSamples> mSampleListener;
+        private Listener<SourceEvent> mSourceEventListener;
+        final AtomicBoolean mStopped = new AtomicBoolean(false);
+        final CountDownLatch mStartedLatch = new CountDownLatch(1);
+
+        @Override public SampleType getSampleType() { return SampleType.COMPLEX; }
+        @Override public double getSampleRate() { return 25_000.0; }
+        @Override public long getFrequency() { return FREQ; }
+        @Override public void setListener(Listener<ComplexSamples> listener) { mSampleListener = listener; }
+        @Override public Listener<SourceEvent> getSourceEventListener() { return mSourceEventListener; }
+        @Override public void setSourceEventListener(Listener<SourceEvent> listener) { mSourceEventListener = listener; }
+        @Override public void removeSourceEventListener() { mSourceEventListener = null; }
+        @Override public void reset() {}
+        @Override public void dispose() { stop(); }
+        @Override public void stop() { mStopped.set(true); }
+
+        @Override
+        public void start()
+        {
+            mStartedLatch.countDown();
+            // Block until interrupted — simulates a long-running energy gate
+            try
+            {
+                Thread.sleep(30_000);
+            }
+            catch(InterruptedException e)
+            {
+                Thread.currentThread().interrupt();
+            }
+            // Never push samples → energy gate sees zero readings
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void classify_cancelledMidProbe_returnsCancelledAndCleansUp() throws Exception
+    {
+        LongBlockingComplexSource blockingSource = new LongBlockingComplexSource();
+        NeverLockProbeChainFactory factory = new NeverLockProbeChainFactory();
+        SourceProvider provider = (config, spec, name) -> blockingSource;
+
+        DiscoveryPreference prefs = new DiscoveryPreference(t -> {})
+        {
+            @Override public Duration probeWindow(DecoderType dt) { return Duration.ofMillis(100); }
+        };
+
+        SignalClassifier classifier = new SignalClassifier(provider, factory, prefs, mExecutor);
+
+        ClassificationRequest request = new ClassificationRequest(
+            FREQ, 0,
+            EnumSet.of(DecoderType.NBFM),
+            Duration.ofSeconds(30),
+            false,
+            "real-cancel-test"
+        );
+
+        CompletableFuture<ClassificationResult> future = classifier.classify(request);
+
+        // Wait until start() is called (worker is inside the energy gate)
+        assertTrue(blockingSource.mStartedLatch.await(5, TimeUnit.SECONDS),
+            "classifier should have started within 5s");
+
+        // Cancel the future — this should interrupt the worker thread
+        future.cancel(true);
+
+        // The future should be cancelled (throws CancellationException)
+        assertThrows(java.util.concurrent.CancellationException.class,
+            () -> future.get(5, TimeUnit.SECONDS));
+
+        // Source must be released (stopped) — poll briefly for cleanup
+        long deadline = System.currentTimeMillis() + 3_000;
+        while(!blockingSource.mStopped.get() && System.currentTimeMillis() < deadline)
+        {
+            Thread.sleep(50);
+        }
+
+        assertTrue(blockingSource.mStopped.get(),
+            "source must be stopped after cancel + interrupt");
+    }
+
+    // =========================================================================
+    // Fix #3: Energy gate floor-relative behaviour
+    // =========================================================================
+
+    /**
+     * A source that delivers two power-distinct sample batches: one low-power (noise floor)
+     * and one high-power (signal), allowing the energy gate to compute a meaningful SNR.
+     */
+    static class TwoPowerLevelSource extends ComplexSource
+    {
+        private Listener<ComplexSamples> mSampleListener;
+        private Listener<SourceEvent> mSourceEventListener;
+        final AtomicBoolean mStopped = new AtomicBoolean(false);
+
+        @Override public SampleType getSampleType() { return SampleType.COMPLEX; }
+        @Override public double getSampleRate() { return 25_000.0; }
+        @Override public long getFrequency() { return FREQ; }
+        @Override public void setListener(Listener<ComplexSamples> listener) { mSampleListener = listener; }
+        @Override public Listener<SourceEvent> getSourceEventListener() { return mSourceEventListener; }
+        @Override public void setSourceEventListener(Listener<SourceEvent> listener) { mSourceEventListener = listener; }
+        @Override public void removeSourceEventListener() { mSourceEventListener = null; }
+        @Override public void reset() {}
+        @Override public void dispose() { stop(); }
+        @Override public void stop() { mStopped.set(true); }
+
+        @Override
+        public void start()
+        {
+            if(mSampleListener == null) return;
+
+            int size = 13_500; // > sampleRate/2 threshold
+
+            // Low-power batch (near-zero samples → low power reading)
+            float[] iLow = new float[size];
+            float[] qLow = new float[size];
+            for(int x = 0; x < size; x++) { iLow[x] = 0.001f; qLow[x] = 0.001f; }
+            mSampleListener.receive(new ComplexSamples(iLow, qLow, System.currentTimeMillis()));
+
+            // High-power batch (full-scale samples → high power reading)
+            float[] iHigh = new float[size];
+            float[] qHigh = new float[size];
+            for(int x = 0; x < size; x++) { iHigh[x] = 1.0f; qHigh[x] = 1.0f; }
+            mSampleListener.receive(new ComplexSamples(iHigh, qHigh, System.currentTimeMillis()));
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void classify_highSnrSignal_passesEnergyGate() throws Exception
+    {
+        TwoPowerLevelSource twoLevelSource = new TwoPowerLevelSource();
+        NeverLockProbeChainFactory factory = new NeverLockProbeChainFactory();
+        SourceProvider provider = (config, spec, name) -> twoLevelSource;
+
+        DiscoveryPreference prefs = new DiscoveryPreference(t -> {})
+        {
+            @Override public Duration probeWindow(DecoderType dt) { return Duration.ofMillis(100); }
+            @Override public double getEnergyThresholdDb() { return 6.0; }
+        };
+
+        SignalClassifier classifier = new SignalClassifier(provider, factory, prefs, mExecutor);
+
+        ClassificationRequest request = new ClassificationRequest(
+            FREQ, 0,
+            EnumSet.of(DecoderType.NBFM),
+            Duration.ofSeconds(5),
+            false,
+            "high-snr"
+        );
+
+        ClassificationResult result = classifier.classify(request).get();
+
+        // A signal clearly above the noise floor should pass the gate → proceed to probe
+        assertNotEquals(ClassificationOutcome.NO_SIGNAL, result.outcome(),
+            "High SNR signal should pass the energy gate and proceed to probe");
     }
 }
