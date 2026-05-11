@@ -31,6 +31,10 @@ import io.github.dsheirer.controller.channel.Channel;
 import io.github.dsheirer.controller.channel.ChannelAutoStartFrame;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelSelectionManager;
+import io.github.dsheirer.controller.channel.map.ChannelMapModel;
+import io.github.dsheirer.module.discovery.ProbeChainFactory;
+import io.github.dsheirer.module.discovery.SignalClassifier;
+import io.github.dsheirer.module.discovery.SourceProvider;
 import io.github.dsheirer.eventbus.MyEventBus;
 import io.github.dsheirer.gui.icon.ViewIconManagerRequest;
 import io.github.dsheirer.gui.playlist.ViewPlaylistRequest;
@@ -62,6 +66,9 @@ import io.github.dsheirer.spectrum.ShowTunerMenuItem;
 import io.github.dsheirer.spectrum.SpectralDisplayPanel;
 import io.github.dsheirer.util.ThreadPool;
 import io.github.dsheirer.util.TimeStamp;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import io.github.dsheirer.vector.calibrate.CalibrationManager;
 import java.awt.AWTException;
 import java.awt.Desktop;
@@ -137,6 +144,8 @@ public class SDRTrunk implements Listener<TunerEvent>
     private JavaFxWindowManager mJavaFxWindowManager;
     private UserPreferences mUserPreferences = new UserPreferences();
     private TunerManager mTunerManager;
+    private ExecutorService mDiscoveryExecutor;
+    private SignalClassifier mSignalClassifier;
     private ApplicationLog mApplicationLog;
     private ResourceMonitor mResourceMonitor;
     private JFXPanel mResourceStatusPanel;
@@ -197,6 +206,20 @@ public class SDRTrunk implements Listener<TunerEvent>
         AliasModel aliasModel = new AliasModel();
         EventLogManager eventLogManager = new EventLogManager(aliasModel, mUserPreferences);
         mPlaylistManager = new PlaylistManager(mUserPreferences, mTunerManager, aliasModel, eventLogManager, mIconModel);
+
+        // --- Signal Discovery Engine (Phase 1 — no UI yet) -------------------
+        mDiscoveryExecutor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "discovery-worker");
+            t.setDaemon(true);
+            return t;
+        });
+        SourceProvider sourceProvider = (config, spec, name) ->
+            (io.github.dsheirer.source.ComplexSource) mTunerManager.getSource(config, spec, name);
+        ProbeChainFactory probeChainFactory = new ProbeChainFactory(aliasModel,
+            mPlaylistManager.getChannelMapModel(), mUserPreferences);
+        mSignalClassifier = new SignalClassifier(sourceProvider, probeChainFactory,
+            mUserPreferences.getDiscoveryPreference(), mDiscoveryExecutor);
+        // --- End Signal Discovery Engine -------------------------------------
 
         boolean headless = GraphicsEnvironment.isHeadless();
 
@@ -655,6 +678,22 @@ public class SDRTrunk implements Listener<TunerEvent>
         mSpectralPanel.clearTuner();
         mLog.info("Stopping tuners ...");
         mTunerManager.stop();
+        mLog.info("Stopping discovery executor ...");
+
+        if(mDiscoveryExecutor != null)
+        {
+            mDiscoveryExecutor.shutdownNow();
+
+            try
+            {
+                mDiscoveryExecutor.awaitTermination(3, TimeUnit.SECONDS);
+            }
+            catch(InterruptedException e)
+            {
+                Thread.currentThread().interrupt();
+            }
+        }
+
         mLog.info("Shutdown complete.");
         mApplicationLog.stop();
     }
