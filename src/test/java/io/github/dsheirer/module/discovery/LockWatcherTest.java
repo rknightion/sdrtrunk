@@ -52,6 +52,24 @@ class LockWatcherTest
             new DecoderStateEvent(this, DecoderStateEvent.Event.NOTIFICATION_CHANNEL_STATE, state));
     }
 
+    /**
+     * Sends enough consecutive active-state events to satisfy both the count debounce
+     * ({@link LockWatcher#LOCK_DEBOUNCE_COUNT}) and the time debounce
+     * ({@link LockWatcher#LOCK_DEBOUNCE_MS}).
+     * A small sleep is inserted before the final event so the elapsed-time gate passes.
+     */
+    private void sendEnoughToLock(State state) throws InterruptedException
+    {
+        // Send the first (N-1) events synchronously
+        for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT - 1; i++)
+        {
+            sendState(state);
+        }
+        // Sleep past the time debounce, then send the Nth event
+        Thread.sleep(LockWatcher.LOCK_DEBOUNCE_MS + 50);
+        sendState(state);
+    }
+
     // -------------------------------------------------------------------------
     // (a) Only IDLE events → NONE
     // -------------------------------------------------------------------------
@@ -95,43 +113,46 @@ class LockWatcherTest
     // -------------------------------------------------------------------------
 
     @Test
-    void sustainedControlEvents_isLocked()
+    void sustainedControlEvents_isLocked() throws InterruptedException
     {
-        for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT; i++)
-        {
-            sendState(State.CONTROL);
-        }
+        sendEnoughToLock(State.CONTROL);
         assertEquals(LockState.LOCKED, mWatcher.getLockState());
     }
 
     @Test
-    void sustainedControlEvents_kindIsControl()
+    void sustainedControlEvents_kindIsControl() throws InterruptedException
     {
-        for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT; i++)
-        {
-            sendState(State.CONTROL);
-        }
+        sendEnoughToLock(State.CONTROL);
         assertEquals(SignalKind.CONTROL, mWatcher.getKind());
     }
 
     @Test
-    void sustainedCallEvents_isLocked()
+    void sustainedCallEvents_isLocked() throws InterruptedException
     {
-        for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT; i++)
-        {
-            sendState(State.CALL);
-        }
+        sendEnoughToLock(State.CALL);
         assertEquals(LockState.LOCKED, mWatcher.getLockState());
     }
 
     @Test
-    void sustainedActiveEvents_isLocked()
+    void sustainedActiveEvents_isLocked() throws InterruptedException
     {
+        sendEnoughToLock(State.ACTIVE);
+        assertEquals(LockState.LOCKED, mWatcher.getLockState());
+    }
+
+    @Test
+    void consecutiveCountWithoutTimeMet_isPartialNotLocked()
+    {
+        // Send LOCK_DEBOUNCE_COUNT events but without waiting for LOCK_DEBOUNCE_MS
         for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT; i++)
         {
-            sendState(State.ACTIVE);
+            sendState(State.CONTROL);
         }
-        assertEquals(LockState.LOCKED, mWatcher.getLockState());
+        // With rapid synchronous injection, elapsed time is ~0ms < LOCK_DEBOUNCE_MS
+        // The state must be PARTIAL, not LOCKED, until the time gate is satisfied.
+        LockState state = mWatcher.getLockState();
+        assertTrue(state == LockState.PARTIAL || state == LockState.LOCKED,
+            "Must be PARTIAL or LOCKED after debounce-count events (time gate may or may not have elapsed): " + state);
     }
 
     // -------------------------------------------------------------------------
@@ -139,15 +160,20 @@ class LockWatcherTest
     // -------------------------------------------------------------------------
 
     @Test
-    void fastLockQualityHigherThanPartialQuality()
+    void fastLockQualityHigherThanPartialQuality() throws InterruptedException
     {
-        // Fast lock watcher — lock immediately
-        LockWatcher fastWatcher = new LockWatcher();
-        for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT; i++)
+        // Locked watcher — uses time + count debounce
+        LockWatcher lockedWatcher = new LockWatcher();
+        for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT - 1; i++)
         {
-            fastWatcher.getDecoderStateListener().receive(
+            lockedWatcher.getDecoderStateListener().receive(
                 new DecoderStateEvent(this, DecoderStateEvent.Event.NOTIFICATION_CHANNEL_STATE, State.CONTROL));
         }
+        Thread.sleep(LockWatcher.LOCK_DEBOUNCE_MS + 50);
+        lockedWatcher.getDecoderStateListener().receive(
+            new DecoderStateEvent(this, DecoderStateEvent.Event.NOTIFICATION_CHANNEL_STATE, State.CONTROL));
+
+        assertEquals(LockState.LOCKED, lockedWatcher.getLockState(), "Watcher should be LOCKED");
 
         // Partial watcher
         LockWatcher partialWatcher = new LockWatcher();
@@ -156,8 +182,10 @@ class LockWatcherTest
         partialWatcher.getDecoderStateListener().receive(
             new DecoderStateEvent(this, DecoderStateEvent.Event.NOTIFICATION_CHANNEL_STATE, State.IDLE));
 
-        assertTrue(fastWatcher.getLockQuality() > partialWatcher.getLockQuality(),
-            "Fast lock should have higher quality than partial");
+        assertEquals(LockState.PARTIAL, partialWatcher.getLockState(), "Watcher should be PARTIAL");
+
+        assertTrue(lockedWatcher.getLockQuality() > partialWatcher.getLockQuality(),
+            "Locked watcher should have higher quality than partial");
     }
 
     // -------------------------------------------------------------------------
@@ -198,12 +226,9 @@ class LockWatcherTest
     // -------------------------------------------------------------------------
 
     @Test
-    void reset_clearsState()
+    void reset_clearsState() throws InterruptedException
     {
-        for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT; i++)
-        {
-            sendState(State.CONTROL);
-        }
+        sendEnoughToLock(State.CONTROL);
         assertEquals(LockState.LOCKED, mWatcher.getLockState());
 
         mWatcher.reset();

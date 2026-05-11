@@ -21,12 +21,15 @@ package io.github.dsheirer.module.discovery;
 import io.github.dsheirer.channel.state.DecoderStateEvent;
 import io.github.dsheirer.channel.state.IDecoderStateEventListener;
 import io.github.dsheirer.channel.state.State;
+import io.github.dsheirer.identifier.Form;
 import io.github.dsheirer.identifier.IdentifierUpdateListener;
 import io.github.dsheirer.identifier.IdentifierUpdateNotification;
 import io.github.dsheirer.sample.Listener;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,13 +43,13 @@ import org.slf4j.LoggerFactory;
  *   <li>PARTIAL — at least one non-IDLE state was observed, but the lock has not
  *       been sustained past the debounce threshold</li>
  *   <li>LOCKED — a non-IDLE, non-FADE state was observed on {@code LOCK_DEBOUNCE_COUNT}
- *       or more consecutive events</li>
+ *       or more consecutive events <em>and</em> the non-IDLE streak has lasted at least
+ *       {@link #LOCK_DEBOUNCE_MS} milliseconds</li>
  *   <li>ERROR — {@link #markError(String)} was called (decoder threw an exception)</li>
  * </ul>
  *
- * <p>Thread-safety: all writes are protected by {@code synchronized} on {@code this}.
- * Reads are unsynchronised; callers should call {@link #getLockState()} after the
- * probe window has elapsed (from a single thread or with their own synchronisation).</p>
+ * <p>Thread-safety: all public methods and callbacks are {@code synchronized} on {@code this}.
+ * External callers may call {@link #getLockState()} from any thread at any time.</p>
  */
 public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdateListener
 {
@@ -57,12 +60,36 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
      */
     public static final int LOCK_DEBOUNCE_COUNT = 3;
 
+    /**
+     * Minimum duration (ms) that a non-IDLE streak must be sustained before declaring LOCKED.
+     * Works together with {@link #LOCK_DEBOUNCE_COUNT}: both conditions must be satisfied.
+     */
+    public static final long LOCK_DEBOUNCE_MS = 250;
+
+    /**
+     * Identifier forms that carry meaningful metadata about the signal.
+     * Only these forms are stored in the metadata map; noisy forms like STATE,
+     * CHANNEL, CHANNEL_FREQUENCY, SCRAMBLE_PARAMETERS, and DECODER_TYPE are excluded.
+     */
+    private static final Set<Form> METADATA_FORMS = Collections.unmodifiableSet(EnumSet.of(
+        Form.NETWORK_ACCESS_CODE,       // P25 NAC
+        Form.NETWORK,                   // DMR color code / network ID
+        Form.SYSTEM,                    // system ID
+        Form.SITE,                      // site ID
+        Form.TALKGROUP,                 // talkgroup glimpse
+        Form.WACN,                      // P25 WACN
+        Form.RF_SUBSYSTEM,              // RFSS
+        Form.LOCATION_REGISTRATION_AREA // LRA
+    ));
+
     private final Listener<DecoderStateEvent> mDecoderStateListener = this::onDecoderStateEvent;
     private final Listener<IdentifierUpdateNotification> mIdentifierUpdateListener = this::onIdentifierUpdate;
 
     private LockState mLockState = LockState.NONE;
     private SignalKind mKind = SignalKind.UNKNOWN;
-    private final Map<String, String> mMetadata = new HashMap<>();
+
+    /** Insertion-ordered so metadata summary output is deterministic. */
+    private final Map<String, String> mMetadata = new LinkedHashMap<>();
 
     /** Running count of consecutive non-IDLE active events. */
     private int mConsecutiveActiveCount = 0;
@@ -72,6 +99,9 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
 
     /** Total events ever observed (used for quality calculation). */
     private int mTotalEvents = 0;
+
+    /** Wall-clock time (ms) when the current non-IDLE streak began; 0 if not in a streak. */
+    private long mStreakStartMs = 0;
 
     /** Optional error message when state == ERROR. */
     private String mErrorNote;
@@ -103,6 +133,12 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
             mTotalActiveEvents++;
             mConsecutiveActiveCount++;
 
+            // Track streak start time for the time-gate component
+            if(mConsecutiveActiveCount == 1)
+            {
+                mStreakStartMs = System.currentTimeMillis();
+            }
+
             // Update kind
             if(state == State.CONTROL)
             {
@@ -121,8 +157,9 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
                 }
             }
 
-            // Transition state machine
-            if(mConsecutiveActiveCount >= LOCK_DEBOUNCE_COUNT)
+            // Transition state machine: require both count debounce AND time debounce
+            if(mConsecutiveActiveCount >= LOCK_DEBOUNCE_COUNT
+                && (System.currentTimeMillis() - mStreakStartMs) >= LOCK_DEBOUNCE_MS)
             {
                 mLockState = LockState.LOCKED;
             }
@@ -135,6 +172,7 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
         {
             // IDLE / FADE / RESET / TEARDOWN reset the consecutive count
             mConsecutiveActiveCount = 0;
+            mStreakStartMs = 0;
             // Do NOT downgrade from LOCKED or PARTIAL — once seen, keep the best
         }
     }
@@ -163,7 +201,15 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
             return;
         }
 
-        String key = identifier.getForm().name();
+        // Only store forms that carry meaningful protocol metadata
+        Form form = identifier.getForm();
+
+        if(!METADATA_FORMS.contains(form))
+        {
+            return;
+        }
+
+        String key = form.name();
         String value = identifier.getValue().toString();
         mMetadata.put(key, value);
     }
@@ -214,15 +260,17 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
     }
 
     /**
-     * Unmodifiable copy of the collected metadata map.
+     * Unmodifiable copy of the collected metadata map (insertion-ordered).
      */
     public synchronized Map<String, String> getMetadata()
     {
-        return Collections.unmodifiableMap(new HashMap<>(mMetadata));
+        return Collections.unmodifiableMap(new LinkedHashMap<>(mMetadata));
     }
 
     /**
      * Builds a brief human-readable summary string from the collected metadata.
+     * The format is {@code kind [· key:value …]} — the caller in
+     * {@code SignalClassifier} prepends the decoder name.
      */
     public synchronized String getSummary()
     {
@@ -272,6 +320,7 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
         mConsecutiveActiveCount = 0;
         mTotalActiveEvents = 0;
         mTotalEvents = 0;
+        mStreakStartMs = 0;
         mErrorNote = null;
     }
 
