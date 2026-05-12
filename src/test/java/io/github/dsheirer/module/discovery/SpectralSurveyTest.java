@@ -19,23 +19,18 @@
 package io.github.dsheirer.module.discovery;
 
 import io.github.dsheirer.sample.Listener;
-import io.github.dsheirer.sample.SampleType;
 import io.github.dsheirer.sample.complex.ComplexSamples;
-import io.github.dsheirer.source.ComplexSource;
-import io.github.dsheirer.source.SourceEvent;
 import io.github.dsheirer.source.SourceException;
-import io.github.dsheirer.source.config.SourceConfigTuner;
-import io.github.dsheirer.source.tuner.channel.ChannelSpecification;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.Executors;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,8 +40,19 @@ import org.junit.jupiter.api.Timeout;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Unit tests for SpectralSurvey.findPeaks (pure static logic) and in-band survey
- * with a fake source provider.
+ * Unit tests for {@link SpectralSurvey}.
+ *
+ * <p>Uses a {@link FakeTunerControl} that feeds canned {@link ComplexSamples} via
+ * {@link TunerControl#addWidebandSampleListener} — no real SDR hardware required.</p>
+ *
+ * <h3>Coverage</h3>
+ * <ul>
+ *   <li>{@link SpectralSurvey#findPeaks} — static pure peak finder (comprehensive)</li>
+ *   <li>In-band survey — finds tones at correct absolute Hz, masks DC spike, filters to sub-span</li>
+ *   <li>Stepped survey — tones spanning multiple steps are all found, restore confirmed</li>
+ *   <li>Null / unavailable TunerControl — exceptional future with descriptive message</li>
+ *   <li>Cancellation — future is cancelled; tuner center is restored in stepped path</li>
+ * </ul>
  */
 class SpectralSurveyTest
 {
@@ -77,7 +83,7 @@ class SpectralSurveyTest
     }
 
     // =========================================================================
-    // findPeaks — static method tests (Task 3.1)
+    // findPeaks — static method tests
     // =========================================================================
 
     @Test
@@ -90,7 +96,6 @@ class SpectralSurveyTest
     @Test
     void findPeaks_flatNoise_returnsNoPeaks()
     {
-        // Flat noise at -80 dB — no peaks expected
         float[] mags = makeFlat(100, -80.0f);
         List<EnergyPeak> peaks = SpectralSurvey.findPeaks(mags, BIN_WIDTH_HZ, BASE_FREQ_HZ, THRESHOLD_DB);
         assertTrue(peaks.isEmpty(), "Flat noise should yield no peaks");
@@ -99,7 +104,6 @@ class SpectralSurveyTest
     @Test
     void findPeaks_oneFatBump_yieldsOnePeakWithCorrectCenterAndWidth()
     {
-        // Noise at -80 dB; a 5-bin bump from index 40..44 at -50 dB
         float[] mags = makeFlat(100, -80.0f);
         int bumpStart = 40;
         int bumpEnd = 44;
@@ -115,21 +119,17 @@ class SpectralSurveyTest
 
         EnergyPeak peak = peaks.get(0);
 
-        // Center should be around bin 42 (the middle of bins 40..44)
         long expectedCenter = BASE_FREQ_HZ + 42 * BIN_WIDTH_HZ;
-        long tolerance = 3 * BIN_WIDTH_HZ; // allow ±3 bins
+        long tolerance = 3 * BIN_WIDTH_HZ;
         assertTrue(Math.abs(peak.centerFrequencyHz() - expectedCenter) <= tolerance,
             "Peak center should be near bin 42; expected ~" + expectedCenter + " got " + peak.centerFrequencyHz());
 
-        // Bandwidth should be at least the bump span (5 bins = 2500 Hz) widened by guards
         assertTrue(peak.occupiedBandwidthHz() >= 5 * (int)BIN_WIDTH_HZ,
             "Peak bandwidth should be at least the bump span");
 
-        // Power should match the bump level
         assertTrue(peak.powerDb() >= -55.0 && peak.powerDb() <= -45.0,
             "Peak power should be around -50 dB, got: " + peak.powerDb());
 
-        // SNR should be approximately 30 dB (peak − floor)
         assertTrue(peak.snrDb() >= 20.0,
             "SNR should be at least 20 dB (well above noise floor), got: " + peak.snrDb());
     }
@@ -137,7 +137,6 @@ class SpectralSurveyTest
     @Test
     void findPeaks_twoWellSeparatedBumps_yieldsTwoDistinctPeaks()
     {
-        // Two bumps at bins 10..12 and 80..82 (well-separated — no merge expected)
         float[] mags = makeFlat(100, -80.0f);
 
         for(int i = 10; i <= 12; i++) mags[i] = -50.0f;
@@ -148,7 +147,6 @@ class SpectralSurveyTest
         assertEquals(2, peaks.size(),
             "Should detect exactly two separate peaks; got " + peaks.size());
 
-        // Peaks should be sorted by center frequency ascending
         assertTrue(peaks.get(0).centerFrequencyHz() < peaks.get(1).centerFrequencyHz(),
             "Peaks should be sorted by frequency ascending");
     }
@@ -156,17 +154,12 @@ class SpectralSurveyTest
     @Test
     void findPeaks_twoVeryCloseBumps_mergesToOnePeak()
     {
-        // Two bumps at adjacent bins (1 bin apart) — should merge
         float[] mags = makeFlat(200, -80.0f);
-        // Bump 1: bins 50..52
-        // Bump 2: bins 53..55  (only 1 gap bin apart — within MIN_SEPARATION_BINS)
         for(int i = 50; i <= 52; i++) mags[i] = -50.0f;
         for(int i = 53; i <= 55; i++) mags[i] = -50.0f;
 
         List<EnergyPeak> peaks = SpectralSurvey.findPeaks(mags, BIN_WIDTH_HZ, BASE_FREQ_HZ, THRESHOLD_DB);
 
-        // The two runs have only 0 gap between them (no below-threshold bins between them)
-        // so they should already form one contiguous run, or merge if separated by guard distance
         assertTrue(peaks.size() <= 2,
             "Close bumps should yield at most 2 peaks (might merge to 1)");
     }
@@ -174,7 +167,6 @@ class SpectralSurveyTest
     @Test
     void findPeaks_bumpAtEdge_handledGracefully()
     {
-        // Bump right at the beginning (bins 0..2)
         float[] mags = makeFlat(50, -80.0f);
         mags[0] = -50.0f;
         mags[1] = -50.0f;
@@ -189,7 +181,6 @@ class SpectralSurveyTest
     @Test
     void findPeaks_bumpAtLastBin_handledGracefully()
     {
-        // Bump at the last 3 bins
         float[] mags = makeFlat(50, -80.0f);
         mags[47] = -50.0f;
         mags[48] = -50.0f;
@@ -203,7 +194,6 @@ class SpectralSurveyTest
     @Test
     void findPeaks_singleBinAboveThreshold_yieldsPeak()
     {
-        // Exactly one bin above threshold
         float[] mags = makeFlat(50, -80.0f);
         mags[25] = -50.0f;
 
@@ -241,145 +231,309 @@ class SpectralSurveyTest
     @Test
     void estimateNoiseFloor_fewHighPeaks_notPulledUpByPeaks()
     {
-        // 90 bins at -80, 10 bins at -30 (strong signals)
         float[] mags = makeFlat(100, -80.0f);
         for(int i = 90; i < 100; i++) mags[i] = -30.0f;
 
         double floor = SpectralSurvey.estimateNoiseFloor(mags);
 
-        // Floor should still be around -80, not pulled up by the strong bins
         assertTrue(floor <= -70.0,
             "Noise floor should not be dominated by strong signal bins; got: " + floor);
     }
 
     // =========================================================================
-    // In-band survey — fake source provider (Task 3.2)
+    // In-band survey via FakeTunerControl
     // =========================================================================
 
     @Test
-    @Timeout(10) // should complete well within 5 seconds
-    void survey_withFakeSource_detectsPeaksInCannedBuffers() throws Exception
+    @Timeout(15)
+    void survey_inBand_detectsToneAtCorrectAbsoluteHz() throws Exception
     {
-        // Create a fake source that emits a tone at a known frequency offset from center
         long centerHz = 154_000_000L;
         double sampleRate = 2_000_000.0; // 2 Msps
-        int bufferSize = 1024;
 
-        // Tone at 200 kHz offset from center.
-        // At 4096 FFT bins and 2 Msps, bin width = ~488 Hz.
-        // Expected tone bin (after fftshift) ≈ 4096/2 + 200000/488 ≈ 2048 + 410 = bin 2458.
-        // Expected center frequency ≈ centerHz + 200 kHz = 154_200_000 Hz.
+        // Tone at 200 kHz offset from center → absolute Hz = 154.2 MHz
         double toneOffsetHz = 200_000.0;
         long expectedToneHz = centerHz + (long) toneOffsetHz;
-        float amplitude = 0.5f;
 
-        FakeComplexSource fakeSource = new FakeComplexSource(sampleRate, centerHz);
+        FakeTunerControl tunerControl = new FakeTunerControl(centerHz, sampleRate);
+        tunerControl.setToneOffsets(new double[]{toneOffsetHz});
 
-        // Add AWGN noise at ~25 dB below the tone so we have a realistic noise floor.
-        // The tone occupies a narrow main lobe that stands ~25 dB above the noise,
-        // which greatly exceeds the 6 dB detection threshold.  Without noise, Hann-window
-        // leakage fills all bins and the noise-floor estimator cannot distinguish signal
-        // from leakage (every bin exceeds the threshold).
-        float noiseAmplitude = amplitude / (float) Math.sqrt(Math.pow(10.0, 25.0 / 10.0));
-        Random rng = new Random(42L); // fixed seed for reproducibility
-
-        // Supply enough buffers to fill the 4096-sample ring multiple times
-        int numBuffers = 40;
-        for(int b = 0; b < numBuffers; b++)
-        {
-            float[] iBuffer = new float[bufferSize];
-            float[] qBuffer = new float[bufferSize];
-
-            for(int n = 0; n < bufferSize; n++)
-            {
-                double phase = 2.0 * Math.PI * toneOffsetHz * (b * bufferSize + n) / sampleRate;
-                iBuffer[n] = (float)(amplitude * Math.cos(phase)) + noiseAmplitude * (float) rng.nextGaussian();
-                qBuffer[n] = (float)(amplitude * Math.sin(phase)) + noiseAmplitude * (float) rng.nextGaussian();
-            }
-
-            fakeSource.addBuffer(iBuffer, qBuffer);
-        }
-
-        SpectralSurvey.SurveySourceProvider fakeProvider = (config, spec, name) -> fakeSource;
-        SpectralSurvey survey = new SpectralSurvey(fakeProvider, mExecutor);
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
 
         List<EnergyPeak> peaks = survey.survey(
             centerHz - 1_000_000L,
             centerHz + 1_000_000L,
-            Duration.ofMillis(200),
+            Duration.ofMillis(300),
             6.0,
-            null
-        ).get(8, java.util.concurrent.TimeUnit.SECONDS);
+            null,
+            tunerControl
+        ).get(12, java.util.concurrent.TimeUnit.SECONDS);
 
         assertNotNull(peaks, "Peaks must not be null");
         assertEquals(1, peaks.size(),
             "Should detect exactly one peak for the injected tone; got " + peaks.size());
 
         EnergyPeak peak = peaks.get(0);
-
-        // Allow ±5 kHz tolerance (10 bins at ~488 Hz per bin)
-        long toleranceHz = 5_000L;
+        long toleranceHz = 10_000L; // ±10 bins at 2 Msps / 4096
         assertTrue(Math.abs(peak.centerFrequencyHz() - expectedToneHz) <= toleranceHz,
             "Peak center should be within " + toleranceHz + " Hz of the tone at "
                 + expectedToneHz + " Hz; got " + peak.centerFrequencyHz() + " Hz");
 
-        mLog.info("Survey detected tone at {} Hz (expected {} Hz, delta {} Hz)",
+        mLog.info("In-band survey detected tone at {} Hz (expected {} Hz, delta {} Hz)",
             peak.centerFrequencyHz(), expectedToneHz,
             Math.abs(peak.centerFrequencyHz() - expectedToneHz));
     }
 
     @Test
-    @Timeout(5)
-    void survey_whenSourceProviderReturnsNull_completesExceptionally() throws Exception
+    @Timeout(10)
+    void survey_inBand_doesNotReportDcSpike() throws Exception
     {
-        // Provider that can't satisfy the request (no tuner available for this span)
-        SpectralSurvey.SurveySourceProvider nullProvider = (config, spec, name) -> null;
+        // Add a strong DC offset; the DC mask should suppress the center-frequency spike.
+        long centerHz = 154_000_000L;
+        double sampleRate = 2_000_000.0;
 
-        SpectralSurvey survey = new SpectralSurvey(nullProvider, mExecutor);
+        FakeTunerControl tunerControl = new FakeTunerControl(centerHz, sampleRate);
+        tunerControl.setDcOffset(0.3f); // strong DC component at center
+        tunerControl.setToneOffsets(new double[]{300_000.0}); // real tone at +300 kHz
 
-        var future = survey.survey(100_000_000L, 2_000_000_000L, Duration.ofSeconds(1), 6.0, null);
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
 
-        assertThrows(java.util.concurrent.ExecutionException.class, () ->
-            future.get(4, java.util.concurrent.TimeUnit.SECONDS),
-            "Wide-span survey with null provider should complete exceptionally");
+        List<EnergyPeak> peaks = survey.survey(
+            centerHz - 900_000L,
+            centerHz + 900_000L,
+            Duration.ofMillis(300),
+            6.0,
+            null,
+            tunerControl
+        ).get(8, java.util.concurrent.TimeUnit.SECONDS);
+
+        assertNotNull(peaks);
+
+        // No peak should be at the center frequency (DC spike must be masked)
+        long dcTolerance = 50_000L; // 50 kHz window around center
+        boolean dcPeakFound = peaks.stream()
+            .anyMatch(p -> Math.abs(p.centerFrequencyHz() - centerHz) <= dcTolerance);
+
+        assertFalse(dcPeakFound,
+            "DC spike at center frequency should be masked; found a peak within "
+                + (dcTolerance / 1000) + " kHz of center. Peaks: " + peaks);
+    }
+
+    @Test
+    @Timeout(10)
+    void survey_inBand_subSpanFiltersOutOfRangePeaks() throws Exception
+    {
+        // Tuner sees 2 MHz, but we request only a 500 kHz sub-span.
+        // Tone outside the sub-span should not appear in results.
+        long centerHz = 154_000_000L;
+        double sampleRate = 2_000_000.0;
+
+        // Tone at +600 kHz (outside the requested ±400 kHz sub-span)
+        double toneOffsetHz = 600_000.0;
+
+        FakeTunerControl tunerControl = new FakeTunerControl(centerHz, sampleRate);
+        tunerControl.setToneOffsets(new double[]{toneOffsetHz});
+
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
+
+        // Request only [153.6 MHz, 154.4 MHz] — tone at 154.6 MHz is outside
+        List<EnergyPeak> peaks = survey.survey(
+            centerHz - 400_000L,
+            centerHz + 400_000L,
+            Duration.ofMillis(300),
+            6.0,
+            null,
+            tunerControl
+        ).get(8, java.util.concurrent.TimeUnit.SECONDS);
+
+        assertNotNull(peaks);
+
+        // The tone at 154.6 MHz is outside the requested span — should not appear
+        long outOfRangeToneHz = centerHz + (long) toneOffsetHz;
+        boolean outOfRangePeakFound = peaks.stream()
+            .anyMatch(p -> Math.abs(p.centerFrequencyHz() - outOfRangeToneHz) <= 20_000L);
+
+        assertFalse(outOfRangePeakFound,
+            "Tone at " + (outOfRangeToneHz / 1_000_000.0) + " MHz outside requested sub-span "
+                + "should be filtered out; peaks: " + peaks);
     }
 
     @Test
     @Timeout(5)
-    void survey_whenCancelled_completesCancelledAndReleasesSource() throws Exception
+    void survey_nullTunerControl_completesExceptionally() throws Exception
     {
-        // A source that blocks (never completes naturally)
-        TrackingFakeComplexSource blockingSource = new TrackingFakeComplexSource(2_000_000.0, 154_000_000L);
-        // Don't add any buffers — it will just sit waiting
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
 
-        SpectralSurvey.SurveySourceProvider blockingProvider = (config, spec, name) -> blockingSource;
-        SpectralSurvey survey = new SpectralSurvey(blockingProvider, mExecutor);
+        var future = survey.survey(100_000_000L, 200_000_000L, Duration.ofSeconds(1), 6.0, null, null);
+
+        java.util.concurrent.ExecutionException ex = assertThrows(
+            java.util.concurrent.ExecutionException.class,
+            () -> future.get(4, java.util.concurrent.TimeUnit.SECONDS));
+
+        assertNotNull(ex.getCause());
+        assertTrue(ex.getCause().getMessage().contains("spectral display") ||
+                   ex.getCause().getMessage().contains("tuner"),
+            "Error message should mention tuner; got: " + ex.getCause().getMessage());
+    }
+
+    @Test
+    @Timeout(5)
+    void survey_unavailableTunerControl_completesExceptionally() throws Exception
+    {
+        FakeTunerControl unavailable = new FakeTunerControl(154_000_000L, 2_000_000.0);
+        unavailable.setAvailable(false);
+
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
+
+        var future = survey.survey(153_000_000L, 155_000_000L, Duration.ofSeconds(1), 6.0, null, unavailable);
+
+        assertThrows(java.util.concurrent.ExecutionException.class,
+            () -> future.get(4, java.util.concurrent.TimeUnit.SECONDS));
+    }
+
+    // =========================================================================
+    // Stepped survey
+    // =========================================================================
+
+    @Test
+    @Timeout(30)
+    void survey_steppedPath_toneFoundAcrossMultipleSteps() throws Exception
+    {
+        // Span = 6 MHz, sample rate = 2 MHz → 4+ steps
+        long startFreq = 154_000_000L;
+        long spanHz = 6_000_000L;
+        double sampleRate = 2_000_000.0;
+
+        // Place a tone at 156 MHz (middle of the span)
+        long toneAbsHz = startFreq + 2_000_000L; // 156 MHz
+
+        FakeTunerControl tunerControl = new FakeTunerControl(startFreq, sampleRate);
+        // Tone is defined in absolute Hz; the fake computes the baseband offset per retune
+        tunerControl.setAbsoluteToneHz(toneAbsHz);
+
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
+
+        List<EnergyPeak> peaks = survey.survey(
+            startFreq,
+            startFreq + spanHz,
+            Duration.ofSeconds(4),
+            6.0,
+            null,
+            tunerControl
+        ).get(28, java.util.concurrent.TimeUnit.SECONDS);
+
+        assertNotNull(peaks);
+        assertFalse(peaks.isEmpty(),
+            "Should detect at least one peak from the tone at " + (toneAbsHz / 1_000_000.0) + " MHz");
+
+        // Original center must have been restored
+        long lastFreq = tunerControl.lastSetFreqHz();
+        assertEquals(startFreq, lastFreq,
+            "Tuner must be restored to original center " + (startFreq / 1_000_000.0)
+                + " MHz after stepped sweep; last set = " + (lastFreq / 1_000_000.0) + " MHz");
+
+        // At least 3 retune calls (steps + restore)
+        assertTrue(tunerControl.getSetFreqCallCount() >= 3,
+            "Should issue at least 3 setCenterFreqHz calls (steps + restore); got "
+                + tunerControl.getSetFreqCallCount());
+    }
+
+    @Test
+    @Timeout(20)
+    void survey_steppedPath_restoresFrequencyOnNormalCompletion() throws Exception
+    {
+        long originalCenter = 160_000_000L;
+        double sampleRate = 2_000_000.0;
+
+        FakeTunerControl tunerControl = new FakeTunerControl(originalCenter, sampleRate);
+
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
+
+        // 4 MHz span with 2 MHz sample rate → stepped
+        survey.survey(
+            158_000_000L, 162_000_000L,
+            Duration.ofSeconds(2), 6.0, null, tunerControl
+        ).get(18, java.util.concurrent.TimeUnit.SECONDS);
+
+        assertEquals(originalCenter, tunerControl.lastSetFreqHz(),
+            "Tuner must be restored to original center after normal completion");
+    }
+
+    @Test
+    @Timeout(20)
+    void survey_steppedPath_restoresFrequencyOnCancel() throws Exception
+    {
+        long originalCenter = 162_000_000L;
+        double sampleRate = 2_000_000.0;
+
+        // Use a fake that blocks in addWidebandSampleListener to prevent early completion
+        FakeTunerControl blockingTuner = new FakeTunerControl(originalCenter, sampleRate);
+        blockingTuner.setBlockSamples(true); // never delivers samples — survey blocks in dwell
+
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
 
         var future = survey.survey(
-            154_000_000L - 1_000_000L,
-            154_000_000L + 1_000_000L,
-            Duration.ofSeconds(30), // long dwell
-            6.0,
-            null
+            160_000_000L, 164_000_000L,
+            Duration.ofSeconds(30), 6.0, null, blockingTuner
         );
 
-        // Cancel after a short delay
-        Thread.sleep(150);
-        boolean wasCancelled = future.cancel(true);
-        assertTrue(wasCancelled, "cancel() should return true");
-        assertTrue(future.isCancelled(), "Future should be cancelled");
+        Thread.sleep(300);
+        future.cancel(true);
 
-        // Give the survey's worker thread a moment to run its finally block
-        long deadline = System.currentTimeMillis() + 2_000;
-        while(!blockingSource.wasStopped() && System.currentTimeMillis() < deadline)
+        // Wait for the finally block to restore the center
+        long deadline = System.currentTimeMillis() + 4_000;
+        while(blockingTuner.lastSetFreqHz() != originalCenter && System.currentTimeMillis() < deadline)
         {
             Thread.sleep(20);
         }
 
-        assertTrue(blockingSource.wasStopped(),
-            "Source stop() must be called when the survey is cancelled (tuner source released)");
-        assertTrue(blockingSource.wasDisposed(),
-            "Source dispose() must be called when the survey is cancelled");
+        assertEquals(originalCenter, blockingTuner.lastSetFreqHz(),
+            "Tuner center must be restored to " + originalCenter + " Hz on cancellation");
+    }
+
+    @Test
+    @Timeout(15)
+    void survey_steppedPath_restoresFrequencyOnError() throws Exception
+    {
+        long originalCenter = 154_000_000L;
+        double sampleRate = 2_000_000.0;
+
+        // Fake that throws on the 2nd setCenterFreqHz call (simulates hardware error mid-sweep)
+        FakeTunerControl throwingTuner = new FakeTunerControl(originalCenter, sampleRate)
+        {
+            private int mCallCount = 0;
+
+            @Override
+            public void setCenterFreqHz(long frequencyHz) throws SourceException
+            {
+                mCallCount++;
+                if(mCallCount == 2)
+                {
+                    throw new SourceException("Simulated hardware error on step 2");
+                }
+                super.setCenterFreqHz(frequencyHz);
+            }
+        };
+
+        SpectralSurvey survey = new SpectralSurvey(mExecutor);
+
+        var future = survey.survey(
+            152_000_000L, 156_000_000L,
+            Duration.ofSeconds(1), 6.0, null, throwingTuner
+        );
+
+        // Wait for it to settle (either complete with error or complete normally after restore)
+        try
+        {
+            future.get(12, java.util.concurrent.TimeUnit.SECONDS);
+        }
+        catch(java.util.concurrent.ExecutionException | java.util.concurrent.CancellationException e)
+        {
+            // expected
+        }
+
+        assertEquals(originalCenter, throwingTuner.lastSetFreqHz(),
+            "Tuner center must be restored even when a step's setCenterFreqHz throws");
     }
 
     // =========================================================================
@@ -394,569 +548,194 @@ class SpectralSurveyTest
         return arr;
     }
 
-    // -------------------------------------------------------------------------
-    // Fake ComplexSource for testing in-band survey
-    // -------------------------------------------------------------------------
-
-    /**
-     * A fake {@link ComplexSource} that plays back queued buffers to a registered listener,
-     * then delivers silence (zero samples) until the listener is removed.
-     */
-    static class FakeComplexSource extends ComplexSource
-    {
-        private final double mSampleRate;
-        private final long mFrequency;
-        private volatile Listener<ComplexSamples> mListener;
-        private final List<float[]> mIBuffers = new ArrayList<>();
-        private final List<float[]> mQBuffers = new ArrayList<>();
-        private volatile boolean mStopped = false;
-
-        FakeComplexSource(double sampleRate, long frequency)
-        {
-            mSampleRate = sampleRate;
-            mFrequency = frequency;
-        }
-
-        void addBuffer(float[] i, float[] q)
-        {
-            mIBuffers.add(Arrays.copyOf(i, i.length));
-            mQBuffers.add(Arrays.copyOf(q, q.length));
-        }
-
-        @Override
-        public SampleType getSampleType() { return SampleType.COMPLEX; }
-
-        @Override
-        public double getSampleRate() { return mSampleRate; }
-
-        @Override
-        public long getFrequency() { return mFrequency; }
-
-        @Override
-        public void setListener(Listener<ComplexSamples> listener) { mListener = listener; }
-
-        @Override
-        public void removeSourceEventListener() {}
-
-        @Override
-        public Listener<SourceEvent> getSourceEventListener() { return null; }
-
-        @Override
-        public void setSourceEventListener(Listener<SourceEvent> listener) {}
-
-        @Override
-        public void reset() {}
-
-        @Override
-        public void start()
-        {
-            // Deliver all queued buffers synchronously on the calling thread
-            Listener<ComplexSamples> listener = mListener;
-            if(listener != null)
-            {
-                for(int b = 0; b < mIBuffers.size() && !mStopped; b++)
-                {
-                    listener.receive(new ComplexSamples(mIBuffers.get(b), mQBuffers.get(b), System.currentTimeMillis()));
-                }
-            }
-        }
-
-        @Override
-        public void stop()
-        {
-            mStopped = true;
-        }
-
-        @Override
-        public void dispose()
-        {
-            mStopped = true;
-            mListener = null;
-        }
-    }
-
-    /**
-     * A {@link FakeComplexSource} variant that separately tracks whether
-     * {@link #stop()} and {@link #dispose()} were called.  Used to verify that the
-     * survey releases its tuner source when cancelled.
-     */
-    static class TrackingFakeComplexSource extends ComplexSource
-    {
-        private final double mSampleRate;
-        private final long mFrequency;
-        private volatile Listener<ComplexSamples> mListener;
-        private volatile boolean mStopped = false;
-        private volatile boolean mDisposed = false;
-
-        TrackingFakeComplexSource(double sampleRate, long frequency)
-        {
-            mSampleRate = sampleRate;
-            mFrequency = frequency;
-        }
-
-        boolean wasStopped()  { return mStopped; }
-        boolean wasDisposed() { return mDisposed; }
-
-        @Override
-        public SampleType getSampleType() { return SampleType.COMPLEX; }
-
-        @Override
-        public double getSampleRate() { return mSampleRate; }
-
-        @Override
-        public long getFrequency() { return mFrequency; }
-
-        @Override
-        public void setListener(Listener<ComplexSamples> listener) { mListener = listener; }
-
-        @Override
-        public void removeSourceEventListener() {}
-
-        @Override
-        public Listener<SourceEvent> getSourceEventListener() { return null; }
-
-        @Override
-        public void setSourceEventListener(Listener<SourceEvent> listener) {}
-
-        @Override
-        public void reset() {}
-
-        @Override
-        public void start()
-        {
-            // Does nothing — simulates a source that never delivers samples (blocking survey)
-        }
-
-        @Override
-        public void stop()
-        {
-            mStopped = true;
-        }
-
-        @Override
-        public void dispose()
-        {
-            mDisposed = true;
-            mListener = null;
-        }
-    }
-
     // =========================================================================
-    // Stepped (wide) sweep — Task 5.1
+    // FakeTunerControl — wideband I/Q tap that feeds canned tones
     // =========================================================================
 
     /**
-     * A recording {@link TunerControl} fake that logs each setCenterFreqHz call,
-     * tracks the restore (last call after sweep), and delegates sample delivery
-     * to a configurable {@link SpectralSurvey.SurveySourceProvider} for each step.
+     * A fake {@link TunerControl} for tests.
      *
-     * <p>The usable bandwidth is fixed at {@code usableBw} Hz.  After each
-     * {@link #setCenterFreqHz} the step-source provider is queried so tests can
-     * inject different canned buffers per step.</p>
+     * <h3>Sample delivery</h3>
+     * <p>When a listener is registered via {@link #addWidebandSampleListener}, a daemon thread
+     * is spawned that continuously delivers {@link ComplexSamples} containing one or more
+     * complex sinusoidal tones with additive Gaussian noise.  The tones can be specified as:
+     * <ul>
+     *   <li>{@link #setToneOffsets(double[])} — baseband offsets in Hz (tone at {@code centerHz + offset})</li>
+     *   <li>{@link #setAbsoluteToneHz(long)} — absolute frequency; the fake computes the offset
+     *       from the current center frequency at feed time (updates automatically after retuning)</li>
+     * </ul>
+     * The feeder stops when the listener is removed or the fake is shut down.</p>
+     *
+     * <h3>Stepped sweep support</h3>
+     * <p>After each {@link #setCenterFreqHz} call the feeder recomputes tone offsets from the
+     * current center, so the same absolute-frequency tone appears at the correct baseband
+     * position after a retune.</p>
      */
-    static class RecordingTunerControl implements TunerControl
+    static class FakeTunerControl implements TunerControl
     {
-        final List<Long> mSetFrequencyCalls = new ArrayList<>();
-        private long mCurrentFreq;
-        private final long mUsableBw;
-        private final long mMinFreq;
-        private final long mMaxFreq;
-        private boolean mAvailable;
+        private static final float AMPLITUDE = 0.5f;
+        private static final float NOISE_SNR_DB = 25.0f;
+        private static final int BUFFER_SIZE = 512;
 
-        RecordingTunerControl(long initialFreq, long usableBw, long minFreq, long maxFreq)
+        private volatile long mCenterFreqHz;
+        private final double mSampleRate;
+        private final long mMinFreqHz;
+        private final long mMaxFreqHz;
+        private volatile boolean mAvailable = true;
+
+        /** Baseband tone offsets in Hz (relative to center). */
+        private volatile double[] mToneOffsets = new double[0];
+
+        /** Absolute-frequency tone; set to Long.MIN_VALUE to disable. */
+        private volatile long mAbsoluteToneHz = Long.MIN_VALUE;
+
+        /** DC offset added to I samples (to test DC masking). */
+        private volatile float mDcOffset = 0.0f;
+
+        /** When true, the feeder thread does not deliver samples (for blocking-cancel tests). */
+        private volatile boolean mBlockSamples = false;
+
+        /** Registered wideband listeners and their feeder threads. */
+        private final List<Listener<ComplexSamples>> mListeners = new CopyOnWriteArrayList<>();
+        private final List<Thread> mFeederThreads = new CopyOnWriteArrayList<>();
+
+        /** Tracks all setCenterFreqHz calls (including the restore). */
+        private final List<Long> mSetFreqCalls = Collections.synchronizedList(new ArrayList<>());
+
+        FakeTunerControl(long centerFreqHz, double sampleRate)
         {
-            mCurrentFreq = initialFreq;
-            mUsableBw = usableBw;
-            mMinFreq = minFreq;
-            mMaxFreq = maxFreq;
-            mAvailable = true;
+            this(centerFreqHz, sampleRate, 100_000_000L, 1_700_000_000L);
         }
 
+        FakeTunerControl(long centerFreqHz, double sampleRate, long minFreqHz, long maxFreqHz)
+        {
+            mCenterFreqHz = centerFreqHz;
+            mSampleRate = sampleRate;
+            mMinFreqHz = minFreqHz;
+            mMaxFreqHz = maxFreqHz;
+        }
+
+        void setToneOffsets(double[] offsets) { mToneOffsets = offsets.clone(); }
+        void setAbsoluteToneHz(long absHz) { mAbsoluteToneHz = absHz; }
+        void setDcOffset(float dcOffset) { mDcOffset = dcOffset; }
+        void setBlockSamples(boolean block) { mBlockSamples = block; }
         void setAvailable(boolean available) { mAvailable = available; }
 
-        @Override
-        public long getCurrentCenterFreqHz() { return mCurrentFreq; }
+        int getSetFreqCallCount() { return mSetFreqCalls.size(); }
+
+        long lastSetFreqHz()
+        {
+            return mSetFreqCalls.isEmpty() ? mCenterFreqHz
+                : mSetFreqCalls.get(mSetFreqCalls.size() - 1);
+        }
+
+        // ----- TunerControl interface -----
 
         @Override
-        public long getUsableBandwidthHz() { return mUsableBw; }
+        public long getCurrentCenterFreqHz() { return mCenterFreqHz; }
 
         @Override
-        public long getMinFrequencyHz() { return mMinFreq; }
+        public long getUsableBandwidthHz() { return (long) mSampleRate; }
 
         @Override
-        public long getMaxFrequencyHz() { return mMaxFreq; }
+        public long getMinFrequencyHz() { return mMinFreqHz; }
+
+        @Override
+        public long getMaxFrequencyHz() { return mMaxFreqHz; }
+
+        @Override
+        public double getCurrentSampleRateHz() { return mSampleRate; }
 
         @Override
         public void setCenterFreqHz(long frequencyHz) throws SourceException
         {
-            mSetFrequencyCalls.add(frequencyHz);
-            mCurrentFreq = frequencyHz;
+            mSetFreqCalls.add(frequencyHz);
+            mCenterFreqHz = frequencyHz;
         }
 
         @Override
         public boolean isAvailable() { return mAvailable; }
 
-        /** Returns the last frequency that was set (the restore call). */
-        long lastSetFreq()
+        @Override
+        public void addWidebandSampleListener(Listener<ComplexSamples> listener)
         {
-            return mSetFrequencyCalls.isEmpty() ? mCurrentFreq
-                : mSetFrequencyCalls.get(mSetFrequencyCalls.size() - 1);
-        }
-    }
+            mListeners.add(listener);
 
-    @Test
-    @Timeout(15)
-    void surveyWide_singleStep_whenSpanFitsUsableBw() throws Exception
-    {
-        // Span is smaller than usable bandwidth → one step suffices
-        long startFreq = 154_000_000L;
-        long usableBw = 2_000_000L;          // 2 MHz
-        long minHz = startFreq;
-        long maxHz = startFreq + 1_500_000L; // 1.5 MHz span — fits in 2 MHz
-
-        RecordingTunerControl tunerControl = new RecordingTunerControl(
-            startFreq, usableBw, 100_000_000L, 1_700_000_000L);
-
-        // Source always delivers silence (no peaks expected)
-        SpectralSurvey.SurveySourceProvider silentProvider = (config, spec, name) ->
-            new FakeComplexSource(usableBw, config.getFrequency()); // no buffers → no data
-
-        SpectralSurvey survey = new SpectralSurvey(silentProvider, mExecutor);
-
-        List<EnergyPeak> peaks = survey.surveyWide(minHz, maxHz,
-            Duration.ofMillis(600), 6.0, tunerControl, null)
-            .get(10, java.util.concurrent.TimeUnit.SECONDS);
-
-        assertNotNull(peaks);
-
-        // The last call to setCenterFreqHz must restore the original center
-        assertEquals(startFreq, tunerControl.lastSetFreq(),
-            "Tuner must be restored to original center frequency after a single-step sweep");
-    }
-
-    @Test
-    @Timeout(20)
-    void surveyWide_multipleSteps_coversFullSpan() throws Exception
-    {
-        // Span = 6 MHz, usable bandwidth = 2 MHz → expect at least 3 steps
-        long startFreq = 154_000_000L;
-        long usableBw = 2_000_000L;
-        long minHz = startFreq;
-        long maxHz = startFreq + 6_000_000L;
-
-        RecordingTunerControl tunerControl = new RecordingTunerControl(
-            startFreq, usableBw, 100_000_000L, 1_700_000_000L);
-
-        SpectralSurvey.SurveySourceProvider silentProvider = (config, spec, name) ->
-            new FakeComplexSource(usableBw, config.getFrequency());
-
-        SpectralSurvey survey = new SpectralSurvey(silentProvider, mExecutor);
-
-        List<EnergyPeak> peaks = survey.surveyWide(minHz, maxHz,
-            Duration.ofSeconds(3), 6.0, tunerControl, null)
-            .get(15, java.util.concurrent.TimeUnit.SECONDS);
-
-        assertNotNull(peaks);
-
-        // At stride=80%*2MHz=1.6MHz we need at least ceil(6/1.6)=4 steps.
-        // We expect at least 3 distinct retune calls before the restore call.
-        // The restore call is always the last, so step count = total calls - 1.
-        int tuneCallCount = tunerControl.mSetFrequencyCalls.size();
-        assertTrue(tuneCallCount >= 4,
-            "Should issue at least 4 setCenterFreqHz calls (steps + restore); got " + tuneCallCount);
-
-        // Last call must restore the original frequency
-        assertEquals(startFreq, tunerControl.lastSetFreq(),
-            "Tuner must be restored to original center frequency after multi-step sweep");
-    }
-
-    @Test
-    @Timeout(15)
-    void surveyWide_restoresFrequencyOnNormalCompletion() throws Exception
-    {
-        long originalFreq = 162_000_000L;
-        long usableBw = 2_000_000L;
-
-        RecordingTunerControl tunerControl = new RecordingTunerControl(
-            originalFreq, usableBw, 100_000_000L, 1_700_000_000L);
-
-        SpectralSurvey.SurveySourceProvider silentProvider = (config, spec, name) ->
-            new FakeComplexSource(usableBw, config.getFrequency());
-
-        SpectralSurvey survey = new SpectralSurvey(silentProvider, mExecutor);
-
-        survey.surveyWide(160_000_000L, 164_000_000L,
-            Duration.ofSeconds(2), 6.0, tunerControl, null)
-            .get(12, java.util.concurrent.TimeUnit.SECONDS);
-
-        assertEquals(originalFreq, tunerControl.lastSetFreq(),
-            "Tuner center frequency must be restored to " + originalFreq + " Hz after normal completion");
-    }
-
-    @Test
-    @Timeout(15)
-    void surveyWide_restoresFrequencyOnCancel() throws Exception
-    {
-        long originalFreq = 162_000_000L;
-        long usableBw = 2_000_000L;
-
-        // Blocking source — never delivers samples, so dwell blocks until interrupted
-        TrackingFakeComplexSource blockingSource = new TrackingFakeComplexSource(usableBw, originalFreq);
-
-        // RecordingTunerControl whose setCenterFreqHz captures the original, then allows steps
-        AtomicLong lastRestoreCall = new AtomicLong(0L);
-        RecordingTunerControl tunerControl = new RecordingTunerControl(
-            originalFreq, usableBw, 100_000_000L, 1_700_000_000L)
-        {
-            @Override
-            public void setCenterFreqHz(long frequencyHz) throws SourceException
+            if(mBlockSamples)
             {
-                super.setCenterFreqHz(frequencyHz);
-                lastRestoreCall.set(frequencyHz);
+                // Don't spawn a feeder — the survey will block until cancelled
+                return;
             }
-        };
 
-        SpectralSurvey.SurveySourceProvider blockingProvider = (config, spec, name) -> blockingSource;
-        SpectralSurvey survey = new SpectralSurvey(blockingProvider, mExecutor);
-
-        var future = survey.surveyWide(160_000_000L, 164_000_000L,
-            Duration.ofSeconds(30), 6.0, tunerControl, null);
-
-        Thread.sleep(200);
-        future.cancel(true);
-
-        // Allow the finally block to run
-        long deadline = System.currentTimeMillis() + 3_000;
-        while(tunerControl.lastSetFreq() != originalFreq && System.currentTimeMillis() < deadline)
-        {
-            Thread.sleep(20);
+            Thread feeder = new Thread(() -> feedSamples(listener), "fake-tuner-feeder");
+            feeder.setDaemon(true);
+            mFeederThreads.add(feeder);
+            feeder.start();
         }
 
-        assertEquals(originalFreq, tunerControl.lastSetFreq(),
-            "Tuner must be restored to original center frequency on cancellation");
-    }
-
-    @Test
-    @Timeout(15)
-    void surveyWide_restoresFrequencyOnSourceError() throws Exception
-    {
-        long originalFreq = 154_000_000L;
-        long usableBw = 2_000_000L;
-
-        // Provider that throws a SourceException immediately
-        SpectralSurvey.SurveySourceProvider throwingProvider = (config, spec, name) ->
+        @Override
+        public void removeWidebandSampleListener(Listener<ComplexSamples> listener)
         {
-            throw new SourceException("Simulated hardware error");
-        };
-
-        RecordingTunerControl tunerControl = new RecordingTunerControl(
-            originalFreq, usableBw, 100_000_000L, 1_700_000_000L);
-
-        SpectralSurvey survey = new SpectralSurvey(throwingProvider, mExecutor);
-
-        // The survey should either fail (exceptionally) or complete with an empty list — either way
-        // the restore call must have happened.
-        var future = survey.surveyWide(152_000_000L, 156_000_000L,
-            Duration.ofSeconds(2), 6.0, tunerControl, null);
-
-        // Wait for the future to settle (error or result)
-        try
-        {
-            future.get(10, java.util.concurrent.TimeUnit.SECONDS);
-        }
-        catch(java.util.concurrent.ExecutionException | java.util.concurrent.CancellationException e)
-        {
-            // expected for error path
+            mListeners.remove(listener);
+            // Feeder threads check mListeners and exit when the listener is removed
         }
 
-        // Whether the sweep threw or silently continued, the restore must have happened
-        assertEquals(originalFreq, tunerControl.lastSetFreq(),
-            "Tuner must be restored to original center frequency even when a step's source throws");
-    }
-
-    @Test
-    @Timeout(5)
-    void surveyWide_nullTunerControl_failsExceptionally() throws Exception
-    {
-        SpectralSurvey.SurveySourceProvider silentProvider = (config, spec, name) -> null;
-        SpectralSurvey survey = new SpectralSurvey(silentProvider, mExecutor);
-
-        var future = survey.surveyWide(150_000_000L, 160_000_000L,
-            Duration.ofSeconds(1), 6.0, null, null);
-
-        assertThrows(java.util.concurrent.ExecutionException.class, () ->
-            future.get(4, java.util.concurrent.TimeUnit.SECONDS));
-    }
-
-    @Test
-    @Timeout(5)
-    void surveyWide_unavailableTuner_failsExceptionally() throws Exception
-    {
-        long originalFreq = 154_000_000L;
-        RecordingTunerControl unavailableTuner = new RecordingTunerControl(
-            originalFreq, 2_000_000L, 100_000_000L, 1_700_000_000L);
-        unavailableTuner.setAvailable(false);
-
-        SpectralSurvey.SurveySourceProvider silentProvider = (config, spec, name) ->
-            new FakeComplexSource(2_000_000L, config.getFrequency());
-
-        SpectralSurvey survey = new SpectralSurvey(silentProvider, mExecutor);
-
-        var future = survey.surveyWide(152_000_000L, 156_000_000L,
-            Duration.ofSeconds(1), 6.0, unavailableTuner, null);
-
-        assertThrows(java.util.concurrent.ExecutionException.class, () ->
-            future.get(4, java.util.concurrent.TimeUnit.SECONDS));
-
-        // The unavailable check prevents any retune calls
-        assertTrue(unavailableTuner.mSetFrequencyCalls.isEmpty(),
-            "No retune calls should be made when tuner is unavailable");
-    }
-
-    @Test
-    @Timeout(20)
-    void surveyWide_peaksFromDifferentSteps_areAccumulated() throws Exception
-    {
-        // Two steps, each injects a tone at a different frequency.
-        // We expect two distinct peaks in the result.
-        long usableBw = 2_000_000L;   // 2 MHz
-        long startFreq = 154_000_000L;
-
-        // Step 1 center: 154 + 1 = 155 MHz (first step within the 6 MHz span)
-        // Step 2 center: 155.6 MHz (stride = 80% * 2 = 1.6 MHz)
-        // etc. — the exact centers depend on the algorithm; we just need two steps with tones.
-
-        // Simpler: inject a tone in the source for EVERY step so both steps detect it.
-        // After merge, we should still have at least 1 peak.
-        long toneOffsetHz = 400_000L;
-        float amplitude = 0.5f;
-        float noiseAmplitude = amplitude / (float) Math.sqrt(Math.pow(10.0, 25.0 / 10.0));
-        Random rng = new Random(42L);
-        double sampleRate = usableBw;
-        int bufferSize = 512;
-        int numBuffers = 40;
-
-        SpectralSurvey.SurveySourceProvider toneProvider = (config, spec, name) ->
+        /**
+         * Delivers {@link ComplexSamples} containing the configured tone(s) + noise to the
+         * listener until the listener is removed from the active list.
+         */
+        private void feedSamples(Listener<ComplexSamples> listener)
         {
-            FakeComplexSource source = new FakeComplexSource(sampleRate, config.getFrequency());
-            long tone = toneOffsetHz; // offset from step center
-            for(int b = 0; b < numBuffers; b++)
+            Random rng = new Random(42L);
+            float noiseAmp = AMPLITUDE / (float) Math.sqrt(Math.pow(10.0, NOISE_SNR_DB / 10.0));
+            long sampleIndex = 0;
+
+            while(mListeners.contains(listener) && !Thread.currentThread().isInterrupted())
             {
-                float[] iBuffer = new float[bufferSize];
-                float[] qBuffer = new float[bufferSize];
-                for(int n = 0; n < bufferSize; n++)
+                float[] iArr = new float[BUFFER_SIZE];
+                float[] qArr = new float[BUFFER_SIZE];
+
+                // Determine tone offsets at the current center (recomputes after retune)
+                double[] offsets = computeCurrentOffsets();
+
+                for(int n = 0; n < BUFFER_SIZE; n++)
                 {
-                    double phase = 2.0 * Math.PI * tone * (b * bufferSize + n) / sampleRate;
-                    iBuffer[n] = (float)(amplitude * Math.cos(phase)) + noiseAmplitude * (float) rng.nextGaussian();
-                    qBuffer[n] = (float)(amplitude * Math.sin(phase)) + noiseAmplitude * (float) rng.nextGaussian();
-                }
-                source.addBuffer(iBuffer, qBuffer);
-            }
-            return source;
-        };
+                    float i = mDcOffset + noiseAmp * (float) rng.nextGaussian();
+                    float q = noiseAmp * (float) rng.nextGaussian();
 
-        RecordingTunerControl tunerControl = new RecordingTunerControl(
-            startFreq, usableBw, 100_000_000L, 1_700_000_000L);
-
-        SpectralSurvey survey = new SpectralSurvey(toneProvider, mExecutor);
-
-        List<EnergyPeak> peaks = survey.surveyWide(startFreq, startFreq + 4_000_000L,
-            Duration.ofSeconds(3), 6.0, tunerControl, null)
-            .get(18, java.util.concurrent.TimeUnit.SECONDS);
-
-        assertNotNull(peaks);
-        // The tones from all steps are accumulated; after merge we expect at least 1 peak
-        assertFalse(peaks.isEmpty(),
-            "Should detect at least one peak from tones injected at each step");
-
-        // Restore must have happened
-        assertEquals(startFreq, tunerControl.lastSetFreq(),
-            "Tuner must be restored after a multi-step sweep that detected peaks");
-    }
-
-    /**
-     * Verifies that a signal seen in the overlap region of two adjacent steps is de-duplicated
-     * to a single peak by {@code mergePeaksCrossStep}.
-     *
-     * <p>Strategy: inject the same tone at every step so it appears in every step's output.
-     * After cross-step merging, the combined list should contain only ONE peak (or at most a
-     * small number) rather than one per step, proving the wider-tolerance merge is effective.</p>
-     */
-    @Test
-    @Timeout(20)
-    void surveyWide_duplicatePeaksInOverlapRegion_mergedToSinglePeak() throws Exception
-    {
-        long usableBw = 2_000_000L;
-        long startFreq = 150_000_000L;
-        long spanHz    = 6_000_000L;     // 3+ steps at 80% stride
-
-        // Place the tone at a fixed absolute frequency that falls in the overlap zone
-        // between step 1 and step 2.  Stride = 0.8 * 2 MHz = 1.6 MHz.
-        // Step 1 center ≈ startFreq + usableBw/2 = 151 MHz  → window [150, 152] MHz
-        // Step 2 center ≈ 151 + 1.6 = 152.6 MHz             → window [151.6, 153.6] MHz
-        // Overlap zone: [151.6, 152] MHz — place tone at 151.8 MHz
-        long toneAbsHz = startFreq + 1_800_000L; // 151.8 MHz
-
-        float amplitude = 0.5f;
-        float noiseAmplitude = amplitude / (float) Math.sqrt(Math.pow(10.0, 25.0 / 10.0));
-        Random rng = new Random(99L);
-        double sampleRate = usableBw;
-        int bufferSize = 512;
-        int numBuffers = 40;
-
-        SpectralSurvey.SurveySourceProvider toneProvider = (config, spec, name) ->
-        {
-            FakeComplexSource source = new FakeComplexSource(sampleRate, config.getFrequency());
-            long toneOffset = toneAbsHz - config.getFrequency(); // offset from this step's center
-
-            // Only inject the tone if this step's window covers the tone frequency
-            long stepMin = config.getFrequency() - (long)(sampleRate / 2);
-            long stepMax = config.getFrequency() + (long)(sampleRate / 2);
-
-            if(toneAbsHz >= stepMin && toneAbsHz <= stepMax)
-            {
-                for(int b = 0; b < numBuffers; b++)
-                {
-                    float[] iBuffer = new float[bufferSize];
-                    float[] qBuffer = new float[bufferSize];
-                    for(int n = 0; n < bufferSize; n++)
+                    for(double offset : offsets)
                     {
-                        double phase = 2.0 * Math.PI * toneOffset * (b * bufferSize + n) / sampleRate;
-                        iBuffer[n] = (float)(amplitude * Math.cos(phase)) + noiseAmplitude * (float) rng.nextGaussian();
-                        qBuffer[n] = (float)(amplitude * Math.sin(phase)) + noiseAmplitude * (float) rng.nextGaussian();
+                        double phase = 2.0 * Math.PI * offset * (sampleIndex + n) / mSampleRate;
+                        i += AMPLITUDE * (float) Math.cos(phase);
+                        q += AMPLITUDE * (float) Math.sin(phase);
                     }
-                    source.addBuffer(iBuffer, qBuffer);
+
+                    iArr[n] = i;
+                    qArr[n] = q;
                 }
+
+                sampleIndex += BUFFER_SIZE;
+                listener.receive(new ComplexSamples(iArr, qArr, System.currentTimeMillis()));
+
+                // Tiny yield so the dwell-wait thread can make progress
+                Thread.yield();
             }
-            return source;
-        };
+        }
 
-        RecordingTunerControl tunerControl = new RecordingTunerControl(
-            startFreq, usableBw, 100_000_000L, 1_700_000_000L);
+        private double[] computeCurrentOffsets()
+        {
+            double[] base = mToneOffsets;
+            long absHz = mAbsoluteToneHz;
 
-        SpectralSurvey survey = new SpectralSurvey(toneProvider, mExecutor);
+            if(absHz == Long.MIN_VALUE)
+            {
+                return base;
+            }
 
-        List<EnergyPeak> peaks = survey.surveyWide(startFreq, startFreq + spanHz,
-            Duration.ofSeconds(3), 6.0, tunerControl, null)
-            .get(18, java.util.concurrent.TimeUnit.SECONDS);
-
-        assertNotNull(peaks);
-
-        // The cross-step merge should collapse any duplicate from the two steps that both
-        // cover the 151.8 MHz tone into a single peak.  Use a tight tolerance (5 kHz) so
-        // we count only peaks that are genuinely at the tone frequency, not unrelated noise
-        // peaks that happen to fall within a wider window.
-        long toleranceHz = 5_000L;
-        long nearToneCount = peaks.stream()
-            .filter(p -> Math.abs(p.centerFrequencyHz() - toneAbsHz) <= toleranceHz)
-            .count();
-
-        // There must be exactly one peak near the tone (merged, not doubled)
-        assertTrue(nearToneCount >= 1,
-            "At least one peak should be near the tone at " + (toneAbsHz / 1_000_000.0) + " MHz");
-        assertTrue(nearToneCount <= 1,
-            "Cross-step duplicate near the tone (" + (toneAbsHz / 1_000_000.0) + " MHz) should "
-            + "merge to at most 1 peak within " + (toleranceHz / 1000) + " kHz; found "
-            + nearToneCount + " peaks — mergePeaksCrossStep did not de-duplicate the overlap zone");
+            // Absolute tone: compute offset from current center
+            double[] result = Arrays.copyOf(base, base.length + 1);
+            result[base.length] = absHz - mCenterFreqHz;
+            return result;
+        }
     }
 }

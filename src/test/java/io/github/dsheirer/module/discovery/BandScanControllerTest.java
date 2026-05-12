@@ -106,7 +106,8 @@ class BandScanControllerTest
         @Override
         public CompletableFuture<List<EnergyPeak>> survey(long minHz, long maxHz, Duration dwell,
                                                            double thresholdDb,
-                                                           SpectralSurvey.ProgressListener progress)
+                                                           SpectralSurvey.ProgressListener progress,
+                                                           TunerControl tunerControl)
         {
             if(progress != null)
             {
@@ -132,7 +133,8 @@ class BandScanControllerTest
         @Override
         public CompletableFuture<List<EnergyPeak>> survey(long minHz, long maxHz, Duration dwell,
                                                            double thresholdDb,
-                                                           SpectralSurvey.ProgressListener progress)
+                                                           SpectralSurvey.ProgressListener progress,
+                                                           TunerControl tunerControl)
         {
             // Return a CompletableFuture whose cancel() releases the simulated source
             CompletableFuture<List<EnergyPeak>> future = new CompletableFuture<List<EnergyPeak>>()
@@ -318,7 +320,7 @@ class BandScanControllerTest
             mChannelFactory,
             mUserPreferences,
             mExecutor,
-            null); // null tunerControl — in-band only; tests inject fake surveys directly
+            new StubTunerControl()); // stub tuner — tests inject fake surveys; TunerControl is passed through
     }
 
     private static ScanRequest simpleScan()
@@ -1068,17 +1070,17 @@ class BandScanControllerTest
         // switching: the first call returns the blocking survey, the second returns the fast one.
         AtomicInteger callCount = new AtomicInteger(0);
 
-        SpectralSurveyApi switchingSurvey = (minHz, maxHz, dwell, threshold, progress) ->
+        SpectralSurveyApi switchingSurvey = (minHz, maxHz, dwell, threshold, progress, tunerControl) ->
         {
             int call = callCount.incrementAndGet();
 
             if(call == 1)
             {
-                return slowSurvey.survey(minHz, maxHz, dwell, threshold, progress);
+                return slowSurvey.survey(minHz, maxHz, dwell, threshold, progress, tunerControl);
             }
             else
             {
-                return fastSurvey.survey(minHz, maxHz, dwell, threshold, progress);
+                return fastSurvey.survey(minHz, maxHz, dwell, threshold, progress, tunerControl);
             }
         };
 
@@ -1117,7 +1119,7 @@ class BandScanControllerTest
     void stopSetsCancelledState() throws InterruptedException
     {
         // Use a slow survey to ensure we can stop before it completes
-        SpectralSurveyApi slowSurvey = (minHz, maxHz, dwell, thresholdDb, progress) ->
+        SpectralSurveyApi slowSurvey = (minHz, maxHz, dwell, thresholdDb, progress, tunerControl) ->
         {
             CompletableFuture<List<EnergyPeak>> future = new CompletableFuture<>();
             // Never complete — the test will call stop()
@@ -1245,7 +1247,7 @@ class BandScanControllerTest
 
         // First cycle: survey returns FREQ_A; subsequent cycles: survey returns nothing
         AtomicInteger surveyCallCount = new AtomicInteger(0);
-        SpectralSurveyApi switchingSurvey = (minHz, maxHz, dwell, threshold, progress) ->
+        SpectralSurveyApi switchingSurvey = (minHz, maxHz, dwell, threshold, progress, tunerControl) ->
         {
             int call = surveyCallCount.incrementAndGet();
             List<EnergyPeak> peaks = (call == 1) ? List.of(makePeak(FREQ_A)) : List.of();
@@ -1288,70 +1290,58 @@ class BandScanControllerTest
     // -------------------------------------------------------------------------
 
     /**
-     * A {@link SpectralSurveyApi} fake that records calls to both {@code survey} and
-     * {@code surveyWide}.
+     * A {@link SpectralSurveyApi} fake that records calls to {@code survey} and captures
+     * the {@link TunerControl} passed to it.
      *
-     * <p>When {@code failInBand} is {@code true}, calls to {@link #survey} complete
-     * exceptionally with a "stepped sweep" error message, triggering the
-     * {@link BandScanController} automatic fallback to {@link #surveyWide}.</p>
+     * <p>When {@code failSurvey} is {@code true}, calls to {@link #survey} complete
+     * exceptionally with a descriptive error message (simulating e.g. tuner unavailable).</p>
      */
     private static class RecordingWideSurvey implements SpectralSurveyApi
     {
-        private final List<EnergyPeak> mInBandPeaks;
-        private final List<EnergyPeak> mWidePeaks;
-        private final boolean mFailInBand;
+        private final List<EnergyPeak> mPeaks;
+        private final boolean mFailSurvey;
         private final AtomicInteger mSurveyCallCount = new AtomicInteger(0);
-        private final AtomicInteger mSurveyWideCallCount = new AtomicInteger(0);
         private final AtomicReference<TunerControl> mLastTunerControl = new AtomicReference<>(null);
 
-        RecordingWideSurvey(List<EnergyPeak> inBandPeaks, List<EnergyPeak> widePeaks)
+        RecordingWideSurvey(List<EnergyPeak> peaks)
         {
-            this(inBandPeaks, widePeaks, false);
+            this(peaks, false);
         }
 
-        RecordingWideSurvey(List<EnergyPeak> inBandPeaks, List<EnergyPeak> widePeaks, boolean failInBand)
+        RecordingWideSurvey(List<EnergyPeak> peaks, boolean failSurvey)
         {
-            mInBandPeaks = inBandPeaks;
-            mWidePeaks = widePeaks;
-            mFailInBand = failInBand;
+            mPeaks = peaks;
+            mFailSurvey = failSurvey;
+        }
+
+        /** Legacy 3-arg constructor kept for call-site compatibility. */
+        RecordingWideSurvey(List<EnergyPeak> ignoredInBandPeaks, List<EnergyPeak> peaks, boolean failSurvey)
+        {
+            this(failSurvey ? List.of() : peaks, failSurvey);
         }
 
         @Override
         public CompletableFuture<List<EnergyPeak>> survey(long minHz, long maxHz, Duration dwell,
                                                            double thresholdDb,
-                                                           SpectralSurvey.ProgressListener progress)
+                                                           SpectralSurvey.ProgressListener progress,
+                                                           TunerControl tunerControl)
         {
             mSurveyCallCount.incrementAndGet();
+            mLastTunerControl.set(tunerControl);
 
-            if(mFailInBand)
+            if(mFailSurvey)
             {
-                // Simulate the "span too wide" failure that triggers the stepped-sweep fallback.
-                // The error message must contain "stepped sweep" to match the fallback detection
-                // logic in BandScanController.runSurvey().
                 CompletableFuture<List<EnergyPeak>> failed = new CompletableFuture<>();
                 failed.completeExceptionally(new RuntimeException(
-                    "No tuner capacity — A stepped sweep is required for spans wider than bandwidth"));
+                    "Band scan requires the spectral display to be showing a tuner."));
                 return failed;
             }
 
             if(progress != null) progress.onProgress(1.0);
-            return CompletableFuture.completedFuture(mInBandPeaks);
+            return CompletableFuture.completedFuture(mPeaks);
         }
 
-        @Override
-        public CompletableFuture<List<EnergyPeak>> surveyWide(long minHz, long maxHz, Duration dwell,
-                                                               double thresholdDb,
-                                                               TunerControl tunerControl,
-                                                               SpectralSurvey.ProgressListener progress)
-        {
-            mSurveyWideCallCount.incrementAndGet();
-            mLastTunerControl.set(tunerControl);
-            if(progress != null) progress.onProgress(1.0);
-            return CompletableFuture.completedFuture(mWidePeaks);
-        }
-
-        int getSurveyCallCount()     { return mSurveyCallCount.get(); }
-        int getSurveyWideCallCount() { return mSurveyWideCallCount.get(); }
+        int getSurveyCallCount()           { return mSurveyCallCount.get(); }
         TunerControl getLastTunerControl() { return mLastTunerControl.get(); }
     }
 
@@ -1366,6 +1356,11 @@ class BandScanControllerTest
         @Override public long getMaxFrequencyHz()       { return MAX_HZ; }
         @Override public void setCenterFreqHz(long hz)  { /* no-op for test */ }
         @Override public boolean isAvailable()          { return true; }
+        @Override public double getCurrentSampleRateHz() { return 2_000_000.0; }
+        @Override public void addWidebandSampleListener(
+            io.github.dsheirer.sample.Listener<io.github.dsheirer.sample.complex.ComplexSamples> listener) { /* no-op */ }
+        @Override public void removeWidebandSampleListener(
+            io.github.dsheirer.sample.Listener<io.github.dsheirer.sample.complex.ComplexSamples> listener) { /* no-op */ }
     }
 
     /** Creates a controller with an explicit {@link TunerControl} for stepped-sweep tests. */
@@ -1386,45 +1381,38 @@ class BandScanControllerTest
     }
 
     @Test
-    void steppedSweepFallbackIsInvokedWhenInBandFailsAndTunerControlIsPresent()
-        throws InterruptedException
+    void surveyReceivesTunerControlFromController() throws InterruptedException
     {
-        // The in-band survey will fail with "stepped sweep" error; the controller should
-        // automatically fall back to surveyWide using mTunerControl on the controller.
+        // The TunerControl from the controller should be forwarded to survey().
         TunerControl tuner = new StubTunerControl();
-        List<EnergyPeak> widePeaks = List.of(makePeak(FREQ_A), makePeak(FREQ_B));
+        List<EnergyPeak> peaks = List.of(makePeak(FREQ_A), makePeak(FREQ_B));
 
-        // failInBand=true: survey() fails, surveyWide() returns widePeaks
-        RecordingWideSurvey survey = new RecordingWideSurvey(List.of(), widePeaks, true);
+        RecordingWideSurvey survey = new RecordingWideSurvey(peaks, false);
         FakeClassifier classifier = new FakeClassifier(Map.of());
 
-        // TunerControl lives on the controller, not the request
         BandScanController ctrl = makeControllerWithTuner(survey, classifier, tuner);
         ctrl.startScan(simpleScan());
 
         awaitState(ctrl, ScanState.DONE, 5_000);
 
-        // survey (in-band) called once (then failed); surveyWide called once (fallback)
+        // survey() is called once and receives the controller's TunerControl
         assertEquals(1, survey.getSurveyCallCount(),
-            "in-band survey should be attempted once before fallback");
-        assertEquals(1, survey.getSurveyWideCallCount(),
-            "surveyWide should be called as fallback when in-band fails");
+            "survey should be called exactly once");
 
-        // The TunerControl passed to surveyWide should be the one from the controller
         assertNotNull(survey.getLastTunerControl(),
-            "TunerControl from the controller should be forwarded to surveyWide");
+            "TunerControl from the controller should be forwarded to survey()");
 
-        // Both peaks from the stepped sweep should be discovered
+        // Both peaks should be discovered
         assertEquals(2, mModel.getDiscoveries().size(),
-            "Both peaks returned by surveyWide should be probed and discovered");
+            "Both peaks returned by survey() should be probed and discovered");
     }
 
     @Test
-    void inBandPathIsUsedWhenInBandSucceeds() throws InterruptedException
+    void surveyPeaksAreDiscoveredWhenSurveySucceeds() throws InterruptedException
     {
-        // The in-band survey succeeds — even if a TunerControl is present, no fallback needed
-        List<EnergyPeak> inBandPeaks = List.of(makePeak(FREQ_A));
-        RecordingWideSurvey survey = new RecordingWideSurvey(inBandPeaks, List.of(), false);
+        // The survey succeeds and returns one peak; it should be discovered.
+        List<EnergyPeak> peaks = List.of(makePeak(FREQ_A));
+        RecordingWideSurvey survey = new RecordingWideSurvey(peaks, false);
         FakeClassifier classifier = new FakeClassifier(Map.of());
 
         BandScanController ctrl = makeControllerWithTuner(survey, classifier, new StubTunerControl());
@@ -1433,31 +1421,35 @@ class BandScanControllerTest
         awaitState(ctrl, ScanState.DONE, 5_000);
 
         assertEquals(1, survey.getSurveyCallCount(),
-            "in-band survey should be called first");
-        assertEquals(0, survey.getSurveyWideCallCount(),
-            "surveyWide should NOT be called when in-band succeeds");
+            "survey should be called exactly once");
         assertEquals(1, mModel.getDiscoveries().size(),
-            "Peak from in-band survey should be discovered");
+            "Peak from survey() should be discovered");
     }
 
     @Test
-    void noFallbackWhenTunerControlIsNull() throws InterruptedException
+    void noSurveyCalledWhenTunerControlIsNull() throws InterruptedException
     {
-        // Even if in-band fails, no stepped-sweep fallback without TunerControl
-        RecordingWideSurvey survey = new RecordingWideSurvey(List.of(), List.of(), true);
+        // When TunerControl is null, BandScanController fails immediately with ERROR
+        // without calling survey at all.
+        RecordingWideSurvey survey = new RecordingWideSurvey(List.of(), false);
         FakeClassifier classifier = new FakeClassifier(Map.of());
 
-        // null tunerControl → no stepped-sweep fallback
-        BandScanController ctrl = makeController(survey, classifier);
+        // Build controller with null TunerControl explicitly
+        BandScanController ctrl = new BandScanController(
+            classifier, survey, mModel, mChannelModel,
+            new ChannelProcessingManagerAdapter(mChannelProcessingManager),
+            mChannelFactory, mUserPreferences, mExecutor,
+            null); // null tunerControl → immediate ERROR
+
         ctrl.startScan(simpleScan());
 
         awaitState(ctrl, ScanState.ERROR, 5_000);
 
-        assertEquals(1, survey.getSurveyCallCount(),
-            "in-band survey should be attempted");
-        assertEquals(0, survey.getSurveyWideCallCount(),
-            "surveyWide should NOT be called when TunerControl is null");
+        assertEquals(0, survey.getSurveyCallCount(),
+            "survey should NOT be called when TunerControl is null");
         assertEquals(ScanState.ERROR, ctrl.getScanState(),
-            "State should be ERROR when in-band fails and no TunerControl available");
+            "State should be ERROR when TunerControl is null");
+        assertNotNull(ctrl.getLastErrorMessage(),
+            "Error message should be set when TunerControl is null");
     }
 }
