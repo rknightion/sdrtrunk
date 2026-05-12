@@ -123,6 +123,9 @@ public class SpectralDisplayPanel extends JPanel
     /** Pending-classification overlay; null until wired via {@link #setClickToTuneController}. */
     private PendingClassificationOverlay mPendingOverlay;
 
+    /** Discovery overlay; null until wired via {@link #setDiscoveryModel}. */
+    private DiscoveryOverlay mDiscoveryOverlay;
+
     /**
      * Spectral Display Panel provides a frequency component display with a
      * historical waterfall display and a transparent overlay to show frequency,
@@ -208,6 +211,46 @@ public class SpectralDisplayPanel extends JPanel
         mPendingOverlay.setBounds(0, 0, mLayeredPanel.getWidth(), mLayeredPanel.getHeight());
 
         mLayeredPanel.revalidate();
+    }
+
+    /**
+     * Wires in the discovery model and installs the {@link DiscoveryOverlay} on the
+     * {@link JLayeredPane} between the overlay panel and the pending-classification overlay.
+     *
+     * <p>Calling this method a second time disposes the old overlay and installs a new one
+     * (not expected in normal usage, but safe).</p>
+     *
+     * @param discoveryModel the model whose rows are painted; must not be null
+     * @param discoveryPreference preference controlling overlay visibility mode; must not be null
+     */
+    public void setDiscoveryModel(io.github.dsheirer.module.discovery.DiscoveryModel discoveryModel,
+                                   io.github.dsheirer.preference.discovery.DiscoveryPreference discoveryPreference)
+    {
+        // Remove the previous overlay if present
+        if(mDiscoveryOverlay != null)
+        {
+            mDiscoveryOverlay.dispose();
+            mLayeredPanel.remove(mDiscoveryOverlay);
+        }
+
+        mDiscoveryOverlay = new DiscoveryOverlay(discoveryModel, discoveryPreference, mOverlayPanel);
+
+        // Place it above the channel overlay panel but below the pending-classification overlay
+        mLayeredPanel.add(mDiscoveryOverlay, JLayeredPane.MODAL_LAYER);
+        mDiscoveryOverlay.setBounds(0, 0, mLayeredPanel.getWidth(), mLayeredPanel.getHeight());
+
+        mLayeredPanel.revalidate();
+    }
+
+    /**
+     * Returns the current {@link DiscoveryOverlay}, or {@code null} if not yet installed.
+     * Used by the context menu to add the DiscoveryDisplay toggle.
+     *
+     * @return discovery overlay or null
+     */
+    public DiscoveryOverlay getDiscoveryOverlay()
+    {
+        return mDiscoveryOverlay;
     }
 
     private void loadSettings()
@@ -565,6 +608,11 @@ public class SpectralDisplayPanel extends JPanel
 
             mSpectrumPanel.setBounds(0, 0, c.getWidth(), c.getHeight());
             mOverlayPanel.setBounds(0, 0, c.getWidth(), c.getHeight());
+
+            if(mDiscoveryOverlay != null)
+            {
+                mDiscoveryOverlay.setBounds(0, 0, c.getWidth(), c.getHeight());
+            }
 
             if(mPendingOverlay != null)
             {
@@ -940,6 +988,18 @@ public class SpectralDisplayPanel extends JPanel
                     channelDisplayMenu.add(new ChannelDisplayItem(mOverlayPanel, ChannelDisplay.NONE));
 
                     displayMenu.add(channelDisplayMenu);
+
+                    /**
+                     * Discovery Display setting menu (only shown when overlay is installed)
+                     */
+                    if(mDiscoveryOverlay != null)
+                    {
+                        JMenu discoveryDisplayMenu = new JMenu("Discovery");
+                        discoveryDisplayMenu.add(new DiscoveryDisplayItem(mDiscoveryOverlay, DiscoveryOverlay.DiscoveryDisplay.ALL));
+                        discoveryDisplayMenu.add(new DiscoveryDisplayItem(mDiscoveryOverlay, DiscoveryOverlay.DiscoveryDisplay.IDENTIFIED_ONLY));
+                        discoveryDisplayMenu.add(new DiscoveryDisplayItem(mDiscoveryOverlay, DiscoveryOverlay.DiscoveryDisplay.NONE));
+                        displayMenu.add(discoveryDisplayMenu);
+                    }
                 }
 
                 /**
@@ -1229,6 +1289,41 @@ public class SpectralDisplayPanel extends JPanel
                         @Override public void run()
                         {
                             mOverlayPanel.setChannelDisplay(mChannelDisplay);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    /**
+     * JCheckBoxMenuItem that toggles the per-session discovery overlay display mode.
+     */
+    public class DiscoveryDisplayItem extends JCheckBoxMenuItem
+    {
+        private static final long serialVersionUID = 1L;
+
+        private final DiscoveryOverlay mDiscoveryOverlay;
+        private final DiscoveryOverlay.DiscoveryDisplay mDisplay;
+
+        public DiscoveryDisplayItem(DiscoveryOverlay overlay, DiscoveryOverlay.DiscoveryDisplay display)
+        {
+            super(display.name());
+
+            mDiscoveryOverlay = overlay;
+            mDisplay = display;
+
+            setSelected(mDiscoveryOverlay.getDiscoveryDisplay() == mDisplay);
+
+            addActionListener(new ActionListener()
+            {
+                @Override public void actionPerformed(ActionEvent e)
+                {
+                    EventQueue.invokeLater(new Runnable()
+                    {
+                        @Override public void run()
+                        {
+                            mDiscoveryOverlay.setDiscoveryDisplay(mDisplay);
                         }
                     });
                 }
