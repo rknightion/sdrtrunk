@@ -45,7 +45,9 @@ import io.github.dsheirer.log.ApplicationLog;
 import io.github.dsheirer.map.MapService;
 import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.module.discovery.BandScanController;
+import io.github.dsheirer.module.discovery.Candidate;
 import io.github.dsheirer.module.discovery.ClassificationResult;
+import io.github.dsheirer.module.discovery.LockState;
 import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
 import io.github.dsheirer.module.discovery.DiscoveryModel;
 import io.github.dsheirer.module.discovery.ProbeChainFactory;
@@ -324,27 +326,63 @@ public class SDRTrunk implements Listener<TunerEvent>
                         String freq = String.format(Locale.ROOT, "%.4f MHz",
                             result.centerFrequencyHz() / 1e6);
 
-                        Object[] options = {"Keep listening", "Pick decoder...", "Cancel"};
+                        // Collect candidates that reached a PARTIAL lock — we offer them as
+                        // "start it anyway as X?" shortcuts in the miss popup.
+                        java.util.List<Candidate> partials = result.candidates().stream()
+                            .filter(c -> c.lockState() == LockState.PARTIAL)
+                            .collect(java.util.stream.Collectors.toList());
+
+                        // Build the message body; if there are partial candidates, name them.
+                        StringBuilder message = new StringBuilder();
+                        message.append("No confirmed lock at ").append(freq)
+                               .append(" (").append(outcome).append(").");
+                        if(!partials.isEmpty())
+                        {
+                            message.append("\nPartial sync detected: ");
+                            for(int i = 0; i < partials.size(); i++)
+                            {
+                                if(i > 0) message.append(", ");
+                                message.append(partials.get(i).decoderType().getDisplayString());
+                            }
+                            message.append(".");
+                        }
+                        message.append("\nChoose an action:");
+
+                        // Fixed options + one "Start as <partial>" entry per partial candidate
+                        java.util.List<String> optionList = new java.util.ArrayList<>();
+                        optionList.add("Keep listening");
+                        for(Candidate partial : partials)
+                        {
+                            optionList.add("Start as " + partial.decoderType().getDisplayString());
+                        }
+                        optionList.add("Pick decoder...");
+                        optionList.add("Cancel");
+
+                        Object[] options = optionList.toArray();
                         int choice = JOptionPane.showOptionDialog(
                             mSpectralPanel,
-                            "No recognised signal at " + freq + " (" + outcome + ").\n" +
-                            "Choose an action:",
+                            message.toString(),
                             "Click-to-tune: no match",
                             JOptionPane.DEFAULT_OPTION,
                             JOptionPane.INFORMATION_MESSAGE,
                             null,
                             options,
-                            options[2]
+                            options[options.length - 1]
                         );
 
                         if(choice == 0)
                         {
-                            // Keep listening -- re-run the classifier with a longer window
+                            // Keep listening — re-run the classifier with a longer deadline
                             redetect.run();
                         }
-                        else if(choice == 1)
+                        else if(choice > 0 && choice <= partials.size())
                         {
-                            // Build a decoder-picker submenu via a JPopupMenu
+                            // "Start as <partial>" — tune directly with that decoder
+                            tuneAs.accept(partials.get(choice - 1).decoderType());
+                        }
+                        else if(choice == partials.size() + 1)
+                        {
+                            // "Pick decoder..." — show the full decoder picker
                             JPopupMenu picker = new JPopupMenu("Decode as...");
 
                             for(DecoderType type : DecoderType.PRIMARY_DECODERS)
@@ -357,6 +395,7 @@ public class SDRTrunk implements Listener<TunerEvent>
                             picker.show(mSpectralPanel, mSpectralPanel.getWidth() / 2,
                                 mSpectralPanel.getHeight() / 2);
                         }
+                        // else: "Cancel" or dialog closed — no action
                     }
 
                     @Override

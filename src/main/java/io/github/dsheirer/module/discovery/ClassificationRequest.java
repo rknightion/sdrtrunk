@@ -148,4 +148,38 @@ public record ClassificationRequest(
             label
         );
     }
+
+    /**
+     * Creates a classification request for the given frequency, approximate bandwidth, candidate
+     * decoders, and an <em>explicit deadline override</em>.
+     *
+     * <p>Use this overload for the "keep listening" path where the operator has confirmed
+     * they want a longer probing window (controlled by
+     * {@link io.github.dsheirer.preference.discovery.DiscoveryPreference#getKeepListeningDuration()}).</p>
+     *
+     * @param frequencyHz        center frequency to probe
+     * @param bandwidthHz        approximate occupied bandwidth of the signal
+     * @param candidateDecoders  set of decoders to try; if null or empty, all primaries are used
+     * @param label              short label for logging
+     * @param deadline           total time budget for this classification attempt; if null or
+     *                           non-positive the default (12 s) is used
+     * @return a new {@link ClassificationRequest}
+     */
+    public static ClassificationRequest forFrequency(long frequencyHz, int bandwidthHz,
+                                                      EnumSet<DecoderType> candidateDecoders,
+                                                      String label, Duration deadline)
+    {
+        EnumSet<DecoderType> decoders = (candidateDecoders == null || candidateDecoders.isEmpty())
+            ? EnumSet.copyOf(DecoderType.PRIMARY_DECODERS)
+            : EnumSet.copyOf(candidateDecoders);
+
+        return new ClassificationRequest(
+            frequencyHz,
+            bandwidthHz,
+            decoders,
+            (deadline == null || deadline.isNegative() || deadline.isZero()) ? DEFAULT_DEADLINE : deadline,
+            false,
+            label
+        );
+    }
 }

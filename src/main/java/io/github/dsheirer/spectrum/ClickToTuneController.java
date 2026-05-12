@@ -27,6 +27,7 @@ import io.github.dsheirer.module.decode.DecoderFactory;
 import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.module.discovery.ClassificationOutcome;
 import io.github.dsheirer.module.discovery.ClassificationRequest;
+import java.time.Duration;
 import io.github.dsheirer.module.discovery.ClassificationResult;
 import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
 import io.github.dsheirer.module.discovery.SignalClassifier;
@@ -440,14 +441,62 @@ public class ClickToTuneController
         }
         else
         {
-            // UNIDENTIFIED, NO_SIGNAL, ERROR, CANCELLED — show the miss popup
+            // UNIDENTIFIED, NO_SIGNAL, ERROR, CANCELLED — show the miss popup.
+            // The "keep listening" callback re-runs classification with a longer
+            // overallDeadline sourced from DiscoveryPreference.getKeepListeningDuration();
+            // it does NOT change the bandwidth.
+            Duration keepListeningDeadline =
+                mUserPreferences.getDiscoveryPreference().getKeepListeningDuration();
+            int bwHz = mUserPreferences.getDiscoveryPreference().getClickDefaultBandwidthHz();
+
             mUICallbacks.showMissPopup(
                 result,
-                () -> classifyAndTune(result.centerFrequencyHz(),
-                    (int) mUserPreferences.getDiscoveryPreference().getKeepListeningDuration().toSeconds()),
+                () -> classifyWithDeadline(result.centerFrequencyHz(), bwHz, keepListeningDeadline),
                 type -> tuneAs(result.centerFrequencyHz(), type)
             );
         }
+    }
+
+    /**
+     * Like {@link #classifyAndTune(long, int)} but uses an explicit {@code overallDeadline}
+     * for the classification request.
+     *
+     * <p>Used by the "Keep listening" miss-popup action so that the user gets a longer
+     * probing window than the default 12-second deadline.</p>
+     *
+     * @param centerFreqHz  centre frequency of the signal, in Hz
+     * @param approxBwHz    operator-estimated bandwidth, in Hz
+     * @param deadline      overallDeadline to use for the {@link ClassificationRequest}
+     */
+    private void classifyWithDeadline(long centerFreqHz, int approxBwHz, Duration deadline)
+    {
+        int bwHz = (approxBwHz > 0) ? approxBwHz
+            : mUserPreferences.getDiscoveryPreference().getClickDefaultBandwidthHz();
+
+        // Cancel any in-progress classification before starting a new one
+        CompletableFuture<ClassificationResult> prior = mPendingFuture.getAndSet(null);
+        if(prior != null)
+        {
+            prior.cancel(true);
+        }
+
+        mUICallbacks.showPending(centerFreqHz, bwHz);
+
+        ClassificationRequest request = ClassificationRequest.forFrequency(
+            centerFreqHz, bwHz, null,
+            "keep-listening@" + centerFreqHz, deadline);
+
+        CompletableFuture<ClassificationResult> future = mSignalClassifier.classify(request);
+        mPendingFuture.set(future);
+
+        future.whenComplete((result, ex) -> SwingUtilities.invokeLater(() ->
+        {
+            if(!mPendingFuture.compareAndSet(future, null))
+            {
+                return;
+            }
+            handleResult(result, ex);
+        }));
     }
 
     /**

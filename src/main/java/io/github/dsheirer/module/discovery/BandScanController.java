@@ -23,11 +23,14 @@ import io.github.dsheirer.controller.channel.ChannelEvent;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
+import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.util.FxThreads;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -302,13 +305,20 @@ public class BandScanController
             return;
         }
 
+        // Apply excluded decoders from the user's discovery preferences.
+        // This guards programmatic callers that bypass ScanDialog (which does not apply
+        // exclusions itself) as well as the ScanRequest.defaults() factory path.
+        // We compute the effective request exactly once so that the local can be captured
+        // by the lambda below without a "not effectively final" compile error.
+        final ScanRequest effectiveRequest = applyExclusions(request);
+
         // Bump the epoch to invalidate any currently running scan / rescan.
         // stopInternal sets CANCELLED; we immediately re-arm mCurrentEpoch to the new value.
         stopInternal(false);
 
         int myEpoch = mCurrentEpoch.incrementAndGet();
 
-        mActiveScanRequest = request;
+        mActiveScanRequest = effectiveRequest;
         mLastErrorMessage = null;
         // setState(SURVEYING) is deferred into runSurvey() so the survey future is
         // always stored in mActiveSurveyFuture before SURVEYING state is visible.
@@ -316,7 +326,7 @@ public class BandScanController
 
         try
         {
-            Future<?> scanFuture = mExecutor.submit(() -> runScan(request, myEpoch));
+            Future<?> scanFuture = mExecutor.submit(() -> runScan(effectiveRequest, myEpoch));
             mActiveScanFuture.set(scanFuture);
         }
         catch(RejectedExecutionException e)
@@ -1170,6 +1180,46 @@ public class BandScanController
         long peakMax = peak.centerFrequencyHz() + peak.occupiedBandwidthHz() / 2L;
 
         return !mChannelModel.getChannelsInFrequencyRange(peakMin, peakMax).isEmpty();
+    }
+
+    /**
+     * Returns a possibly-new {@link ScanRequest} with the user's excluded decoders removed
+     * from the candidate set.  If the exclusion set is empty or produces no change, the
+     * original request is returned unchanged.
+     *
+     * <p>This ensures the programmatic {@link #startScan(ScanRequest)} path applies the
+     * same exclusions as {@link ScanRequest#defaults(long, long,
+     * io.github.dsheirer.preference.discovery.DiscoveryPreference)}.</p>
+     *
+     * @param request the original scan request
+     * @return the request with excluded decoders removed, or the original if no change
+     */
+    private ScanRequest applyExclusions(ScanRequest request)
+    {
+        Set<DecoderType> excluded = mUserPreferences.getDiscoveryPreference().getExcludedDecoders();
+        if(excluded.isEmpty())
+        {
+            return request;
+        }
+
+        EnumSet<DecoderType> filtered = EnumSet.copyOf(request.candidateDecoders());
+        filtered.removeAll(excluded);
+
+        if(filtered.isEmpty() || filtered.equals(request.candidateDecoders()))
+        {
+            return request;
+        }
+
+        return new ScanRequest(
+            request.minFrequencyHz(),
+            request.maxFrequencyHz(),
+            filtered,
+            request.surveyDwell(),
+            request.thresholdDb(),
+            request.maxSignalsToProbe(),
+            request.continuous(),
+            request.continuousInterval(),
+            request.tunerControl());
     }
 
     /**

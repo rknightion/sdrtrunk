@@ -35,6 +35,7 @@ import io.github.dsheirer.module.discovery.SignalClassifier;
 import io.github.dsheirer.module.discovery.SignalKind;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.source.config.SourceConfigTuner;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -74,6 +75,9 @@ class ClickToTuneControllerTest
     static class FakeSignalClassifier extends SignalClassifier
     {
         private CompletableFuture<ClassificationResult> mNextResult;
+        /** Every ClassificationRequest received by classify(), in call order. */
+        private final List<io.github.dsheirer.module.discovery.ClassificationRequest> mReceivedRequests
+            = new ArrayList<>();
 
         FakeSignalClassifier()
         {
@@ -91,10 +95,16 @@ class ClickToTuneControllerTest
             mNextResult = future;
         }
 
+        List<io.github.dsheirer.module.discovery.ClassificationRequest> getReceivedRequests()
+        {
+            return mReceivedRequests;
+        }
+
         @Override
         public CompletableFuture<ClassificationResult> classify(
             io.github.dsheirer.module.discovery.ClassificationRequest request)
         {
+            mReceivedRequests.add(request);
             return mNextResult != null ? mNextResult : CompletableFuture.completedFuture(
                 ClassificationResult.error(request.centerFrequencyHz(), "no result configured"));
         }
@@ -626,6 +636,121 @@ class ClickToTuneControllerTest
         mController.cancelPending();
 
         assertTrue(pending.isCancelled(), "Future should be cancelled");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 5.3: keep-listening uses extended deadline, not seconds-as-bandwidth
+    // -------------------------------------------------------------------------
+
+    /**
+     * Verifies that invoking the "keep listening" callback from the miss popup
+     * causes the next {@link ClassificationRequest} to use the keep-listening duration
+     * from preferences as its {@code overallDeadline} rather than the default 12 s.
+     *
+     * <p>The bug this guards against: the old code passed
+     * {@code keepListeningDuration().toSeconds()} as the bandwidth parameter (approxBwHz),
+     * which had no effect on the probing window at all.</p>
+     */
+    @Test
+    void keepListeningCallback_usesExtendedDeadline() throws Exception
+    {
+        // First call: no signal -> miss popup shown
+        mFakeClassifier.setNextResult(ClassificationResult.noSignal(FREQ, Double.NaN));
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        assertNotNull(mFakeUI.mRedetectCallback, "Miss popup should have been shown");
+
+        // Configure a second result for the keep-listening re-classify
+        mFakeClassifier.setNextResult(ClassificationResult.noSignal(FREQ, Double.NaN));
+        mFakeUI.mRedetectCallback.run();
+        drainEdt();
+
+        // There should be exactly 2 classify() calls: one for classifyAndTune, one for keep-listening
+        List<io.github.dsheirer.module.discovery.ClassificationRequest> requests =
+            mFakeClassifier.getReceivedRequests();
+        assertEquals(2, requests.size(), "Exactly 2 classify calls expected");
+
+        io.github.dsheirer.module.discovery.ClassificationRequest keepListeningRequest = requests.get(1);
+
+        // The keep-listening deadline should be >= default (12 s) and match prefs
+        Duration defaultDeadline = io.github.dsheirer.module.discovery.ClassificationRequest.DEFAULT_DEADLINE;
+        Duration expectedDeadline = new UserPreferences().getDiscoveryPreference().getKeepListeningDuration();
+
+        assertTrue(
+            keepListeningRequest.overallDeadline().compareTo(defaultDeadline) >= 0,
+            "Keep-listening request deadline (" + keepListeningRequest.overallDeadline()
+                + ") should be >= default deadline (" + defaultDeadline + ")");
+
+        assertEquals(expectedDeadline, keepListeningRequest.overallDeadline(),
+            "Keep-listening request should use the preference keep-listening duration as its deadline");
+
+        // The bandwidth should NOT be the duration-as-seconds (that was the old bug)
+        long badBandwidth = expectedDeadline.getSeconds();
+        assertNotEquals((int) badBandwidth, keepListeningRequest.approximateBandwidthHz(),
+            "Keep-listening request must NOT pass keep-listening seconds as bandwidth");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 5.3: PARTIAL candidates are visible in the miss-popup result
+    // -------------------------------------------------------------------------
+
+    /**
+     * Verifies that when the classifier returns UNIDENTIFIED with PARTIAL candidates,
+     * the {@code result} passed to {@link ClickToTuneController.UICallbacks#showMissPopup}
+     * contains those candidates so the UI layer can offer "start it anyway as X?" actions.
+     */
+    @Test
+    void unidentifiedWithPartialCandidates_resultPassedToMissPopup() throws Exception
+    {
+        List<Candidate> partials = List.of(
+            new Candidate(DecoderType.NBFM,     LockState.PARTIAL, 0.4, "brief sync"),
+            new Candidate(DecoderType.P25_PHASE1, LockState.NONE,  0.0, null)
+        );
+        ClassificationResult unidentified =
+            ClassificationResult.unidentified(FREQ, partials, -75.0);
+
+        mFakeClassifier.setNextResult(unidentified);
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        assertNotNull(mFakeUI.mMissResult, "Miss popup should be shown for UNIDENTIFIED");
+        assertEquals(ClassificationOutcome.UNIDENTIFIED, mFakeUI.mMissResult.outcome());
+
+        // The full result including partial candidates must be passed through
+        long partialCount = mFakeUI.mMissResult.candidates().stream()
+            .filter(c -> c.lockState() == LockState.PARTIAL)
+            .count();
+        assertEquals(1, partialCount,
+            "One PARTIAL candidate should be present in the miss-popup result");
+
+        // Verify the specific decoder
+        DecoderType partialDecoder = mFakeUI.mMissResult.candidates().stream()
+            .filter(c -> c.lockState() == LockState.PARTIAL)
+            .map(Candidate::decoderType)
+            .findFirst().orElse(null);
+        assertEquals(DecoderType.NBFM, partialDecoder,
+            "NBFM should be the PARTIAL candidate passed to miss popup");
+    }
+
+    /**
+     * Verifies that a result with no PARTIAL candidates contains an empty PARTIAL set
+     * so the UI layer correctly shows no "start it anyway as X?" buttons.
+     */
+    @Test
+    void unidentifiedWithNoCandidates_missPopupShowsNoPartials() throws Exception
+    {
+        ClassificationResult unidentified = ClassificationResult.unidentified(FREQ, List.of(), -75.0);
+
+        mFakeClassifier.setNextResult(unidentified);
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        assertNotNull(mFakeUI.mMissResult);
+        long partialCount = mFakeUI.mMissResult.candidates().stream()
+            .filter(c -> c.lockState() == LockState.PARTIAL)
+            .count();
+        assertEquals(0, partialCount, "No PARTIAL candidates when none were returned");
     }
 
     // -------------------------------------------------------------------------

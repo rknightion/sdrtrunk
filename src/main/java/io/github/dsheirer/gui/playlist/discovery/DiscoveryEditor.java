@@ -144,6 +144,13 @@ public class DiscoveryEditor extends BorderPane
      * Selects the table row closest to {@code focusFrequencyHz}.
      * Called when a {@link io.github.dsheirer.gui.playlist.channel.ShowDiscoveryRequest} arrives.
      *
+     * <p>Thread safety: this method always runs on the JavaFX Application Thread.
+     * The call chain is {@code JavaFxWindowManager.execute()} →
+     * {@code PlaylistEditor.process(ShowDiscoveryRequest)} → this method.
+     * {@code JavaFxWindowManager.execute()} wraps every invocation in
+     * {@code Platform.runLater()} when not already on the FX thread, so no additional
+     * threading guard is required here.</p>
+     *
      * @param focusFrequencyHz frequency to focus; 0 = no-op
      */
     public void focusFrequency(long focusFrequencyHz)
