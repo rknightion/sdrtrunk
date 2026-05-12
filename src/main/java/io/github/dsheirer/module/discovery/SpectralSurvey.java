@@ -306,6 +306,337 @@ public class SpectralSurvey implements SpectralSurveyApi
     }
 
     // -------------------------------------------------------------------------
+    // Public method: stepped (wide-span) survey (Task 5.1)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Performs a wide stepped-sweep survey over a span that may exceed the tuner's
+     * instantaneous bandwidth.
+     *
+     * <h3>Algorithm</h3>
+     * <ol>
+     *   <li>Compute the stride width as 80% of the tuner's usable bandwidth ({@code strideFraction = 0.8}).</li>
+     *   <li>Compute step centers: first center = {@code minHz + strideHz/2}, advancing by {@code strideHz}
+     *       until the span is covered.</li>
+     *   <li>For each step: retune the tuner, wait a short settle (100 ms), run an in-band mini-survey
+     *       (per-step dwell = {@code totalDwell / stepCount}, minimum 500 ms), accumulate the peaks.</li>
+     *   <li>Translate each peak's center frequency: peaks from {@link #accumulateAndFindPeaks} are
+     *       already in absolute Hz because the fake/real source reports the step's center frequency.</li>
+     *   <li>After all steps: merge peaks from different steps whose centers are within the
+     *       same step-edge overlap zone (handled by {@link #mergePeaks} at the end).</li>
+     *   <li>{@code finally}: restore the tuner to its original center frequency, even on cancel/error.</li>
+     * </ol>
+     *
+     * <h3>Disruption</h3>
+     * <p>This method calls {@link TunerControl#setCenterFreqHz} repeatedly, which causes active channel
+     * sources on the tuner to receive mistuned samples.  It must only be called after the operator
+     * has confirmed the disruption warning in {@code ScanDialog}.</p>
+     *
+     * @param minHz        lower bound of the span in Hz (inclusive)
+     * @param maxHz        upper bound of the span in Hz (inclusive)
+     * @param dwell        total dwell budget divided equally across all steps
+     * @param thresholdDb  SNR threshold in dB above estimated noise floor
+     * @param tunerControl control seam for reading/setting the tuner center frequency
+     * @param progress     progress listener (0.0..1.0); may be null
+     * @return cancellable future resolving to the merged list of detected peaks (never null, may be empty)
+     */
+    @Override
+    public CompletableFuture<List<EnergyPeak>> surveyWide(long minHz, long maxHz, Duration dwell,
+                                                           double thresholdDb,
+                                                           TunerControl tunerControl,
+                                                           ProgressListener progress)
+    {
+        if(minHz >= maxHz)
+        {
+            CompletableFuture<List<EnergyPeak>> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalArgumentException(
+                "minHz (" + minHz + ") must be less than maxHz (" + maxHz + ")"));
+            return failed;
+        }
+
+        if(tunerControl == null)
+        {
+            CompletableFuture<List<EnergyPeak>> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new IllegalArgumentException("tunerControl must not be null"));
+            return failed;
+        }
+
+        if(!tunerControl.isAvailable())
+        {
+            CompletableFuture<List<EnergyPeak>> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new RuntimeException(
+                "No tuner available for stepped sweep — tunerControl.isAvailable() returned false"));
+            return failed;
+        }
+
+        AtomicBoolean cancelledFlag = new AtomicBoolean(false);
+        AtomicReference<Future<?>> workerFutureRef = new AtomicReference<>();
+
+        CompletableFuture<List<EnergyPeak>> wrapper = new CompletableFuture<List<EnergyPeak>>()
+        {
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning)
+            {
+                cancelledFlag.set(true);
+                boolean cancelled = super.cancel(mayInterruptIfRunning);
+                Future<?> wf = workerFutureRef.get();
+
+                if(wf != null)
+                {
+                    wf.cancel(true);
+                }
+
+                return cancelled;
+            }
+        };
+
+        Future<?> workerFuture = mExecutor.submit(() ->
+        {
+            try
+            {
+                List<EnergyPeak> result = doSteppedSurvey(
+                    minHz, maxHz, dwell, thresholdDb, tunerControl, progress, cancelledFlag);
+
+                if(!cancelledFlag.get())
+                {
+                    wrapper.complete(result);
+                }
+            }
+            catch(Throwable t)
+            {
+                if(!wrapper.isCancelled())
+                {
+                    wrapper.completeExceptionally(t);
+                }
+            }
+        });
+
+        workerFutureRef.set(workerFuture);
+
+        if(wrapper.isCancelled())
+        {
+            workerFuture.cancel(true);
+        }
+
+        return wrapper;
+    }
+
+    // -------------------------------------------------------------------------
+    // Stepped sweep implementation (runs on executor thread)
+    // -------------------------------------------------------------------------
+
+    /**
+     * The fraction of the usable bandwidth used for each step stride.
+     * Using 80% ensures adjacent steps overlap by 20% so no edge frequencies are missed.
+     */
+    private static final double STEP_STRIDE_FRACTION = 0.80;
+
+    /**
+     * Minimum per-step dwell in milliseconds.  Even a very fast sweep must wait long enough
+     * to accumulate at least a few FFT frames (the ring needs filling once, which takes
+     * {@code FFT_SIZE / sampleRate} seconds ≈ 2 ms at 2 Msps; 500 ms gives ~1000 frames,
+     * which is well above the minimum for a meaningful power average).
+     */
+    private static final long MIN_STEP_DWELL_MS = 500L;
+
+    /**
+     * Settle time in milliseconds after each retune before starting sample capture.
+     * Gives the hardware AGC and PLL time to re-lock after a frequency change.
+     */
+    private static final long SETTLE_TIME_MS = 100L;
+
+    /**
+     * Executes the stepped sweep and returns the merged peak list.
+     * Always restores the original center frequency in a {@code finally} block.
+     *
+     * @param minHz         lower bound of the span
+     * @param maxHz         upper bound of the span
+     * @param dwell         total dwell budget
+     * @param thresholdDb   detection threshold
+     * @param tunerControl  tuner frequency control seam
+     * @param progress      progress listener; may be null
+     * @param cancelledFlag cooperative cancellation flag
+     * @return merged peak list from all steps
+     */
+    private List<EnergyPeak> doSteppedSurvey(long minHz, long maxHz, Duration dwell,
+                                               double thresholdDb, TunerControl tunerControl,
+                                               ProgressListener progress,
+                                               AtomicBoolean cancelledFlag)
+    {
+        // Capture the original center frequency so we can restore it in finally
+        long originalCenterHz = tunerControl.getCurrentCenterFreqHz();
+
+        try
+        {
+            return executeSteps(minHz, maxHz, dwell, thresholdDb,
+                tunerControl, progress, cancelledFlag);
+        }
+        finally
+        {
+            // Restore the original center frequency unconditionally
+            try
+            {
+                tunerControl.setCenterFreqHz(originalCenterHz);
+                mLog.debug("Stepped sweep: restored tuner center to {} Hz", originalCenterHz);
+            }
+            catch(Exception ex)
+            {
+                mLog.warn("Stepped sweep: failed to restore tuner center frequency to {} Hz: {}",
+                    originalCenterHz, ex.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Core step loop.  Computes step centers, retunes at each, collects peaks, merges.
+     */
+    private List<EnergyPeak> executeSteps(long minHz, long maxHz, Duration dwell,
+                                           double thresholdDb, TunerControl tunerControl,
+                                           ProgressListener progress,
+                                           AtomicBoolean cancelledFlag)
+    {
+        long usableBw = tunerControl.getUsableBandwidthHz();
+
+        if(usableBw <= 0)
+        {
+            throw new RuntimeException(
+                "Tuner reports zero usable bandwidth — cannot compute step stride");
+        }
+
+        // Stride = 80% of usable bandwidth; overlap at edges catches edge-leakage signals
+        long strideHz = Math.max(1L, (long)(usableBw * STEP_STRIDE_FRACTION));
+
+        // First step center: half a stride inside the left edge
+        // This ensures the left edge of the first step's usable window sits at minHz
+        long firstCenterHz = minHz + usableBw / 2L;
+
+        // Build the list of step centers
+        List<Long> stepCenters = new ArrayList<>();
+        long centerHz = firstCenterHz;
+
+        while(centerHz - usableBw / 2L < maxHz)
+        {
+            stepCenters.add(centerHz);
+            centerHz += strideHz;
+        }
+
+        // Ensure the last center's right edge covers maxHz
+        if(stepCenters.isEmpty() || stepCenters.get(stepCenters.size() - 1) + usableBw / 2L < maxHz)
+        {
+            stepCenters.add(maxHz - usableBw / 2L);
+        }
+
+        // Clamp each center to the tuner's tunable range
+        long minTunable = tunerControl.getMinFrequencyHz();
+        long maxTunable = tunerControl.getMaxFrequencyHz();
+        stepCenters.replaceAll(c -> Math.max(minTunable, Math.min(maxTunable, c)));
+
+        // Remove duplicate centers (can happen if range is much smaller than usable bandwidth,
+        // which shouldn't occur in a stepped sweep but is harmless to guard against)
+        stepCenters = stepCenters.stream().distinct().toList();
+
+        int stepCount = stepCenters.size();
+        mLog.debug("Stepped sweep: {} steps over {} MHz span (stride {} kHz, usableBw {} kHz)",
+            stepCount, (maxHz - minHz) / 1_000_000.0, strideHz / 1_000.0, usableBw / 1_000.0);
+
+        // Per-step dwell: divide total dwell equally, enforce minimum
+        long totalDwellMs = dwell.toMillis();
+        long stepDwellMs = Math.max(MIN_STEP_DWELL_MS, stepCount > 0 ? totalDwellMs / stepCount : totalDwellMs);
+        Duration stepDwell = Duration.ofMillis(stepDwellMs);
+
+        List<EnergyPeak> allPeaks = new ArrayList<>();
+
+        for(int i = 0; i < stepCount; i++)
+        {
+            if(cancelledFlag.get() || Thread.currentThread().isInterrupted())
+            {
+                break;
+            }
+
+            long stepCenter = stepCenters.get(i);
+            int stepIndex = i;
+
+            mLog.debug("Stepped sweep: step {}/{} center={} MHz", i + 1, stepCount,
+                stepCenter / 1_000_000.0);
+
+            // Retune the tuner
+            try
+            {
+                tunerControl.setCenterFreqHz(stepCenter);
+            }
+            catch(Exception ex)
+            {
+                throw new RuntimeException(
+                    "Stepped sweep: failed to retune to " + stepCenter + " Hz at step " +
+                    (i + 1) + "/" + stepCount + ": " + ex.getMessage(), ex);
+            }
+
+            // Settle — give hardware AGC/PLL time to stabilise
+            if(SETTLE_TIME_MS > 0 && !cancelledFlag.get())
+            {
+                try
+                {
+                    Thread.sleep(SETTLE_TIME_MS);
+                }
+                catch(InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+
+            if(cancelledFlag.get() || Thread.currentThread().isInterrupted())
+            {
+                break;
+            }
+
+            // Build a per-step progress listener that maps this step's 0..1 progress
+            // into the overall 0..1 progress range
+            ProgressListener stepProgress = null;
+
+            if(progress != null)
+            {
+                double stepStart = (double) stepIndex / stepCount;
+                double stepRange = 1.0 / stepCount;
+                stepProgress = fraction -> progress.onProgress(stepStart + fraction * stepRange);
+            }
+
+            // Acquire a source for this step's center frequency and run an in-band survey
+            final long stepCenterFinal = stepCenter;
+            final ProgressListener stepProgressFinal = stepProgress;
+
+            try
+            {
+                // Use the same in-band acquisition path as the regular survey
+                List<EnergyPeak> stepPeaks = doSurvey(
+                    stepCenterFinal - usableBw / 2L,
+                    stepCenterFinal + usableBw / 2L,
+                    stepDwell,
+                    thresholdDb,
+                    stepProgressFinal,
+                    cancelledFlag);
+
+                allPeaks.addAll(stepPeaks);
+            }
+            catch(RuntimeException ex)
+            {
+                // A step survey failure should not abort the whole sweep — log and continue
+                mLog.warn("Stepped sweep: step {}/{} survey failed (center={} Hz): {}",
+                    i + 1, stepCount, stepCenter, ex.getMessage());
+            }
+        }
+
+        if(progress != null)
+        {
+            progress.onProgress(1.0);
+        }
+
+        // Merge peaks across step boundaries (overlap regions may double-detect)
+        long binWidthHz = Math.max(1L, (usableBw / FFT_SIZE));
+        return Collections.unmodifiableList(mergePeaks(allPeaks, binWidthHz));
+    }
+
+    // -------------------------------------------------------------------------
     // Core survey logic (runs on executor thread)
     // -------------------------------------------------------------------------
 
