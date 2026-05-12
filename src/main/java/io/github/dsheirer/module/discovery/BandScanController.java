@@ -111,10 +111,10 @@ public class BandScanController
     private final ExecutorService mExecutor;
 
     /**
-     * Optional tuner control for the stepped sweep.  When non-null and available, a scan
-     * whose in-band survey fails with a "span too wide" condition will automatically fall
-     * back to {@link SpectralSurveyApi#surveyWide}.  Set once at construction and never
-     * mutated, so no synchronisation is required.  {@code null} in headless / standalone mode.
+     * Optional tuner control passed to every survey call.  The survey decides internally
+     * whether to run in-band (non-disruptive) or stepped based on span vs sample rate.
+     * Set once at construction and never mutated, so no synchronisation is required.
+     * {@code null} in headless / standalone mode (scan will fail immediately with a message).
      */
     private final TunerControl mTunerControl;
 
@@ -784,6 +784,9 @@ public class BandScanController
      * the epoch became stale, the survey was cancelled, or a fatal error occurred (in each
      * case the appropriate state has already been set).
      *
+     * <p>The survey decides upfront (based on span vs tuner sample rate) whether to run
+     * in-band or stepped.  No in-band→stepped fallback is needed here.</p>
+     *
      * @param request          the active scan request
      * @param myEpoch          the epoch of the current scan pass
      * @param progressStart    the progress fraction at the start of the survey (0.0..1.0)
@@ -793,6 +796,13 @@ public class BandScanController
     private List<EnergyPeak> runSurvey(ScanRequest request, int myEpoch,
                                         double progressStart, double progressEnd)
     {
+        if(mTunerControl == null)
+        {
+            mLastErrorMessage = "Band scan requires the spectral display to be showing a tuner.";
+            setState(ScanState.ERROR);
+            return null;
+        }
+
         double progressRange = progressEnd - progressStart;
 
         // Obtain the future BEFORE publishing SURVEYING state so that any thread that
@@ -802,7 +812,8 @@ public class BandScanController
             request.maxFrequencyHz(),
             request.surveyDwell(),
             request.thresholdDb(),
-            fraction -> setProgress(progressStart + fraction * progressRange));
+            fraction -> setProgress(progressStart + fraction * progressRange),
+            mTunerControl);
 
         // Store before publishing state
         mActiveSurveyFuture.set(surveyFuture);
@@ -851,108 +862,11 @@ public class BandScanController
                 return null;
             }
 
-            // Check if in-band survey failed because the span is too wide.
-            // The error message from SpectralSurvey contains a recognizable marker when
-            // the source provider returned null (span exceeds tuner bandwidth).
-            // If a TunerControl is available, automatically retry with the stepped sweep.
             Throwable cause = (e instanceof java.util.concurrent.ExecutionException && e.getCause() != null)
                 ? e.getCause() : e;
-            String msg = cause.getMessage() != null ? cause.getMessage() : "";
 
-            if(msg.contains("stepped sweep") && mTunerControl != null && mTunerControl.isAvailable())
-            {
-                mLog.info("Band scan: in-band survey failed (span too wide), falling back to stepped sweep "
-                    + "for {} – {} MHz",
-                    request.minFrequencyHz() / 1_000_000.0,
-                    request.maxFrequencyHz() / 1_000_000.0);
-
-                return runSteppedSurvey(request, myEpoch, progressStart, progressEnd);
-            }
-
-            mLog.error("Spectral survey failed: {}", e.getMessage(), e);
-            mLastErrorMessage = e.getMessage() != null ? e.getMessage()
-                : (e.getCause() != null ? e.getCause().getMessage() : "Spectral survey failed");
-            setState(ScanState.ERROR);
-            return null;
-        }
-    }
-
-    /**
-     * Filters peaks (ignore-list + KNOWN channels), adds rows to the model, then probes the
-     * unknowns sequentially.  Returns {@code false} if the epoch became stale (caller should
-     * exit immediately); returns {@code true} if the loop completed normally.
-     *
-    /**
-     * Executes the stepped sweep survey phase and returns the peak list, or {@code null} if the
-     * epoch became stale, the sweep was cancelled, or an error occurred.
-     *
-     * <p>Called from {@link #runSurvey} when the in-band survey fails with a "span too wide"
-     * error and a {@link TunerControl} is available.  The survey future stored in
-     * {@link #mActiveSurveyFuture} is replaced with the stepped-sweep future so that
-     * {@link #stopInternal} can cancel it and the restore-on-cancel path in
-     * {@code SpectralSurvey.doSteppedSurvey} runs correctly.</p>
-     */
-    private List<EnergyPeak> runSteppedSurvey(ScanRequest request, int myEpoch,
-                                               double progressStart, double progressEnd)
-    {
-        if(mCurrentEpoch.get() != myEpoch)
-        {
-            return null;
-        }
-
-        double progressRange = progressEnd - progressStart;
-
-        CompletableFuture<List<EnergyPeak>> steppedFuture = mSpectralSurvey.surveyWide(
-            request.minFrequencyHz(),
-            request.maxFrequencyHz(),
-            request.surveyDwell(),
-            request.thresholdDb(),
-            mTunerControl,
-            fraction -> setProgress(progressStart + fraction * progressRange));
-
-        // Replace the survey future so stopInternal() cancels this one
-        mActiveSurveyFuture.set(steppedFuture);
-
-        try
-        {
-            List<EnergyPeak> peaks = steppedFuture.get();
-            mActiveSurveyFuture.compareAndSet(steppedFuture, null);
-            return peaks;
-        }
-        catch(CancellationException e)
-        {
-            mActiveSurveyFuture.compareAndSet(steppedFuture, null);
-
-            if(mCurrentEpoch.get() == myEpoch)
-            {
-                setState(ScanState.CANCELLED);
-            }
-
-            return null;
-        }
-        catch(InterruptedException e)
-        {
-            mActiveSurveyFuture.compareAndSet(steppedFuture, null);
-
-            if(mCurrentEpoch.get() == myEpoch)
-            {
-                setState(ScanState.CANCELLED);
-            }
-
-            return null;
-        }
-        catch(Exception e)
-        {
-            mActiveSurveyFuture.compareAndSet(steppedFuture, null);
-
-            if(mCurrentEpoch.get() != myEpoch)
-            {
-                return null;
-            }
-
-            mLog.error("Stepped sweep survey failed: {}", e.getMessage(), e);
-            mLastErrorMessage = e.getMessage() != null ? e.getMessage()
-                : (e.getCause() != null ? e.getCause().getMessage() : "Stepped sweep survey failed");
+            mLog.error("Spectral survey failed: {}", cause.getMessage(), cause);
+            mLastErrorMessage = cause.getMessage() != null ? cause.getMessage() : "Spectral survey failed";
             setState(ScanState.ERROR);
             return null;
         }
