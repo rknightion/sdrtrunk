@@ -25,11 +25,14 @@ import io.github.dsheirer.gui.playlist.alias.AliasEditor;
 import io.github.dsheirer.gui.playlist.alias.AliasTabRequest;
 import io.github.dsheirer.gui.playlist.channel.ChannelEditor;
 import io.github.dsheirer.gui.playlist.channel.ChannelTabRequest;
+import io.github.dsheirer.gui.playlist.discovery.DiscoveryEditor;
+import io.github.dsheirer.gui.playlist.discovery.DiscoveryTabRequest;
 import io.github.dsheirer.gui.playlist.manager.PlaylistManagerEditor;
 import io.github.dsheirer.gui.playlist.radioreference.RadioReferenceEditor;
 import io.github.dsheirer.gui.playlist.streaming.StreamingEditor;
 import io.github.dsheirer.gui.preference.PreferenceEditorType;
 import io.github.dsheirer.gui.preference.ViewUserPreferenceEditorRequest;
+import io.github.dsheirer.module.discovery.BandScanController;
 import io.github.dsheirer.playlist.PlaylistManager;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.source.tuner.manager.TunerManager;
@@ -68,27 +71,33 @@ public class PlaylistEditor extends BorderPane
     private PlaylistManager mPlaylistManager;
     private TunerManager mTunerManager;
     private UserPreferences mUserPreferences;
+    private BandScanController mBandScanController;
     private MenuBar mMenuBar;
     private TabPane mTabPane;
     private Tab mPlaylistsTab;
     private Tab mChannelsTab;
     private Tab mAliasesTab;
+    private Tab mDiscoveryTab;
     private Tab mRadioReferenceTab;
     private Tab mStreamingTab;
     private AliasEditor mAliasEditor;
     private ChannelEditor mChannelEditor;
+    private DiscoveryEditor mDiscoveryEditor;
 
     /**
      * Constructs an instance
      * @param playlistManager for alias and channel models
      * @param tunerManager for tuners
      * @param userPreferences for settings
+     * @param bandScanController for band scan discovery; may be null if feature is disabled
      */
-    public PlaylistEditor(PlaylistManager playlistManager, TunerManager tunerManager, UserPreferences userPreferences)
+    public PlaylistEditor(PlaylistManager playlistManager, TunerManager tunerManager, UserPreferences userPreferences,
+                          BandScanController bandScanController)
     {
         mPlaylistManager = playlistManager;
         mTunerManager = tunerManager;
         mUserPreferences = userPreferences;
+        mBandScanController = bandScanController;
 
         //Throw a new runnable back onto the FX thread to lazy load the editor content after the editor has been
         //constructed and shown.
@@ -122,8 +131,25 @@ public class PlaylistEditor extends BorderPane
                     getChannelEditor().process((ChannelTabRequest)request);
                 }
                 break;
+            case DISCOVERY:
+                if(request instanceof DiscoveryTabRequest discoveryRequest && getDiscoveryTab() != null)
+                {
+                    getTabPane().getSelectionModel().select(getDiscoveryTab());
+
+                    if(discoveryRequest.hasScanSpan())
+                    {
+                        getDiscoveryEditor().openScanDialogWithSpan(
+                            discoveryRequest.getScanMinHz(), discoveryRequest.getScanMaxHz());
+                    }
+
+                    if(discoveryRequest.getFocusFrequencyHz() > 0)
+                    {
+                        getDiscoveryEditor().focusFrequency(discoveryRequest.getFocusFrequencyHz());
+                    }
+                }
+                break;
             case PLAYLIST:
-                //Ignore - this is a request to simply show te playlist editor
+                //Ignore - this is a request to simply show the playlist editor
                 break;
             default:
                 mLog.warn("Unrecognized playlist editor request: " + request.getClass());
@@ -201,8 +227,17 @@ public class PlaylistEditor extends BorderPane
         {
             mTabPane = new TabPane();
             mTabPane.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
-            mTabPane.getTabs().addAll(getPlaylistsTab(), getChannelsTab(), getAliasesTab(), getStreamingTab(),
-                getRadioReferenceTab());
+
+            if(mBandScanController != null)
+            {
+                mTabPane.getTabs().addAll(getPlaylistsTab(), getChannelsTab(), getAliasesTab(), getStreamingTab(),
+                    getDiscoveryTab(), getRadioReferenceTab());
+            }
+            else
+            {
+                mTabPane.getTabs().addAll(getPlaylistsTab(), getChannelsTab(), getAliasesTab(), getStreamingTab(),
+                    getRadioReferenceTab());
+            }
         }
 
         return mTabPane;
@@ -281,5 +316,37 @@ public class PlaylistEditor extends BorderPane
         }
 
         return mStreamingTab;
+    }
+
+    /**
+     * Returns the Discovery tab, or {@code null} if no {@link BandScanController} was supplied.
+     */
+    private Tab getDiscoveryTab()
+    {
+        if(mBandScanController == null)
+        {
+            return null;
+        }
+
+        if(mDiscoveryTab == null)
+        {
+            mDiscoveryTab = new Tab("Discovery");
+            mDiscoveryTab.setContent(getDiscoveryEditor());
+        }
+
+        return mDiscoveryTab;
+    }
+
+    /**
+     * Returns the DiscoveryEditor, lazily creating it.  Only valid when {@link BandScanController} was provided.
+     */
+    private DiscoveryEditor getDiscoveryEditor()
+    {
+        if(mDiscoveryEditor == null)
+        {
+            mDiscoveryEditor = new DiscoveryEditor(mBandScanController, mUserPreferences);
+        }
+
+        return mDiscoveryEditor;
     }
 }

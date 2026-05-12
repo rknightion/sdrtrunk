@@ -468,9 +468,13 @@ public class OverlayPanel extends JPanel implements Listener<ChannelEvent>, ISou
     }
 
     /**
-     * Returns the x-axis value corresponding to the frequency
+     * Returns the x-axis pixel value corresponding to the given frequency.
+     * The inverse operation is the already-public {@link #getFrequencyFromAxis(double)}.
+     *
+     * @param frequency the frequency to convert, in Hz
+     * @return pixel x-coordinate on this panel
      */
-    private double getAxisFromFrequency(long frequency)
+    public double getAxisFromFrequency(long frequency)
     {
         double screenWidth = (double)getSize().getWidth();
 
@@ -945,4 +949,5 @@ public class OverlayPanel extends JPanel implements Listener<ChannelEvent>, ISou
     {
         ALL, ENABLED, NONE;
     }
+
 }

@@ -188,6 +188,11 @@ public class UserPreferencesEditor extends BorderPane
             treeRoot.getChildren().add(decoderItem);
             decoderItem.setExpanded(true);
 
+            TreeItem<String> discoveryItem = new TreeItem<>("Discovery");
+            discoveryItem.getChildren().add(new TreeItem(PreferenceEditorType.DISCOVERY));
+            treeRoot.getChildren().add(discoveryItem);
+            discoveryItem.setExpanded(true);
+
             TreeItem<String> displayItem = new TreeItem<>("Display");
             displayItem.getChildren().add(new TreeItem(PreferenceEditorType.CHANNEL_EVENT));
             displayItem.getChildren().add(new TreeItem(PreferenceEditorType.TALKGROUP_FORMAT));

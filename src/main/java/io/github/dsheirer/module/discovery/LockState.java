@@ -1,6 +1,6 @@
 /*
  * *****************************************************************************
- *  Copyright (C) 2014-2020 Dennis Sheirer
+ * Copyright (C) 2014-2026 Dennis Sheirer
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,17 +16,22 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  * ****************************************************************************
  */
-
-package io.github.dsheirer.gui.playlist;
-
-import io.github.dsheirer.gui.JavaFxWindowRequest;
+package io.github.dsheirer.module.discovery;
 
 /**
- * Request to view a facet of the playlist editor
+ * Describes how well a candidate decoder locked onto a probed signal.
  */
-public abstract class PlaylistEditorRequest extends JavaFxWindowRequest
+public enum LockState
 {
-    public enum TabName {ALIAS, CHANNEL, DISCOVERY, PLAYLIST, RADIOREFERENCE, STREAM}
+    /** The decoder achieved a sustained, confirmed lock. */
+    LOCKED,
 
-    public abstract TabName getTabName();
+    /** Sync was detected at least once but was not sustained past the debounce threshold. */
+    PARTIAL,
+
+    /** No sync or active state was ever observed. */
+    NONE,
+
+    /** The probe chain or decoder threw an exception during probing. */
+    ERROR
 }

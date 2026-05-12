@@ -29,8 +29,11 @@ import io.github.dsheirer.gui.icon.ViewIconManagerRequest;
 import io.github.dsheirer.gui.playlist.PlaylistEditor;
 import io.github.dsheirer.gui.playlist.PlaylistEditorRequest;
 import io.github.dsheirer.gui.playlist.ViewPlaylistRequest;
+import io.github.dsheirer.gui.playlist.channel.ScanSpanRequest;
+import io.github.dsheirer.gui.playlist.channel.ShowDiscoveryRequest;
 import io.github.dsheirer.gui.playlist.channelMap.ChannelMapEditor;
 import io.github.dsheirer.gui.playlist.channelMap.ViewChannelMapEditorRequest;
+import io.github.dsheirer.gui.playlist.discovery.DiscoveryTabRequest;
 import io.github.dsheirer.gui.preference.PreferenceEditorType;
 import io.github.dsheirer.gui.preference.UserPreferencesEditor;
 import io.github.dsheirer.gui.preference.ViewUserPreferenceEditorRequest;
@@ -40,6 +43,7 @@ import io.github.dsheirer.gui.viewer.ViewRecordingViewerRequest;
 import io.github.dsheirer.icon.IconModel;
 import io.github.dsheirer.jmbe.JmbeEditor;
 import io.github.dsheirer.jmbe.JmbeEditorRequest;
+import io.github.dsheirer.module.discovery.BandScanController;
 import io.github.dsheirer.module.log.EventLogManager;
 import io.github.dsheirer.monitor.ResourceMonitor;
 import io.github.dsheirer.monitor.StatusBox;
@@ -85,6 +89,9 @@ public class JavaFxWindowManager extends Application
     private UserPreferences mUserPreferences;
     private UserPreferencesEditor mUserPreferencesEditor;
     private MessageRecordingViewer mMessageRecordingViewer;
+
+    /** Band-scan controller for the Discovery tab; null if feature is disabled (no tuner / headless). */
+    private BandScanController mBandScanController;
 
     private Stage mChannelMapStage;
     private Stage mIconManagerStage;
@@ -300,13 +307,25 @@ public class JavaFxWindowManager extends Application
     }
 
     /**
+     * Sets the band-scan controller to be handed to the playlist editor's Discovery tab.
+     * Must be called before the playlist editor is first opened so the Discovery tab appears.
+     *
+     * @param controller band-scan controller; may be null to disable the Discovery tab
+     */
+    public void setBandScanController(BandScanController controller)
+    {
+        mBandScanController = controller;
+    }
+
+    /**
      * Lazy construct and access the playlist editor
      */
     public PlaylistEditor getPlaylistEditor()
     {
         if(mPlaylistEditor == null)
         {
-            mPlaylistEditor = new PlaylistEditor(mPlaylistManager, mTunerManager, mUserPreferences);
+            mPlaylistEditor = new PlaylistEditor(mPlaylistManager, mTunerManager, mUserPreferences,
+                mBandScanController);
         }
 
         return mPlaylistEditor;
@@ -345,6 +364,47 @@ public class JavaFxWindowManager extends Application
             catch(Throwable t)
             {
                 mLog.error("Error processing show playlist editor request", t);
+            }
+        });
+    }
+
+    /**
+     * Processes a show-discovery request posted by the spectral overlay when the user clicks a discovery marker.
+     * Opens the playlist editor, selects the Discovery tab, and focuses the relevant row.
+     */
+    @Subscribe
+    public void process(ShowDiscoveryRequest request)
+    {
+        execute(() -> {
+            try
+            {
+                restoreStage(getPlaylistStage());
+                getPlaylistEditor().process(new DiscoveryTabRequest(request.focusFrequencyHz()));
+            }
+            catch(Throwable t)
+            {
+                mLog.error("Error processing show-discovery request", t);
+            }
+        });
+    }
+
+    /**
+     * Processes a scan-span request posted by the spectral display's "Scan this view…" context menu item.
+     * Opens the playlist editor, selects the Discovery tab, and opens the scan dialog pre-filled with the span.
+     */
+    @Subscribe
+    public void process(ScanSpanRequest request)
+    {
+        execute(() -> {
+            try
+            {
+                restoreStage(getPlaylistStage());
+                getPlaylistEditor().process(
+                    new DiscoveryTabRequest(0L, request.minFrequencyHz(), request.maxFrequencyHz()));
+            }
+            catch(Throwable t)
+            {
+                mLog.error("Error processing scan-span request", t);
             }
         });
     }

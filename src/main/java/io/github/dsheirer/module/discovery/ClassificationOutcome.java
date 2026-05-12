@@ -1,6 +1,6 @@
 /*
  * *****************************************************************************
- *  Copyright (C) 2014-2020 Dennis Sheirer
+ * Copyright (C) 2014-2026 Dennis Sheirer
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,17 +16,25 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  * ****************************************************************************
  */
-
-package io.github.dsheirer.gui.playlist;
-
-import io.github.dsheirer.gui.JavaFxWindowRequest;
+package io.github.dsheirer.module.discovery;
 
 /**
- * Request to view a facet of the playlist editor
+ * High-level outcome of a classification attempt by the SignalClassifier.
  */
-public abstract class PlaylistEditorRequest extends JavaFxWindowRequest
+public enum ClassificationOutcome
 {
-    public enum TabName {ALIAS, CHANNEL, DISCOVERY, PLAYLIST, RADIOREFERENCE, STREAM}
+    /** At least one decoder achieved a sustained lock; bestDecoder/bestDecodeConfig are valid. */
+    IDENTIFIED,
 
-    public abstract TabName getTabName();
+    /** Energy was present but no decoder locked (or only partial locks). */
+    UNIDENTIFIED,
+
+    /** No significant energy was detected at the requested frequency. */
+    NO_SIGNAL,
+
+    /** The classification could not be completed due to an error (e.g. no tuner capacity). */
+    ERROR,
+
+    /** The classification was cancelled by the caller before it could complete. */
+    CANCELLED
 }

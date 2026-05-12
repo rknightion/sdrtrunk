@@ -16,37 +16,31 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  * ****************************************************************************
  */
-
-package io.github.dsheirer.gui.preference;
+package io.github.dsheirer.module.discovery;
 
 /**
- * Preference editor tree node enumeration.
+ * Lifecycle state of a {@link BandScanController} scan operation.
  */
-public enum PreferenceEditorType
+public enum ScanState
 {
-    APPLICATION("Application"),
-    CHANNEL_EVENT("Channel Events"),
-    DIRECTORY("Directories"),
-    DISCOVERY("Signal Discovery"),
-    JMBE_LIBRARY("JMBE Audio Library"),
-    AUDIO_MP3("MP3"),
-    AUDIO_RECORD("Record"),
-    AUDIO_OUTPUT("Playback/Tones"),
-    AUDIO_CALL_MANAGEMENT("Call Management"),
-    SOURCE_TUNERS("Tuners"),
-    TALKGROUP_FORMAT("Talkgroup & Radio ID"),
-    VECTOR_CALIBRATION("Vector Calibration"),
-    DEFAULT("Default");
+    /** No scan is running; the controller is ready to accept a new {@link ScanRequest}. */
+    IDLE,
 
-    private String mLabel;
+    /** The spectral survey is in progress: acquiring and analysing the I/Q spectrum. */
+    SURVEYING,
 
-    PreferenceEditorType(String label)
-    {
-        mLabel = label;
-    }
+    /** The survey is complete; the classifier is probing detected energy peaks. */
+    PROBING,
 
-    public String toString()
-    {
-        return mLabel;
-    }
+    /** All peaks have been probed; the scan completed normally (non-continuous). */
+    DONE,
+
+    /** A continuous scan has completed one cycle and is waiting for the re-survey interval. */
+    IDLE_CONTINUOUS,
+
+    /** The scan was stopped via {@link BandScanController#stop()}. */
+    CANCELLED,
+
+    /** An unexpected error occurred during the scan. */
+    ERROR
 }

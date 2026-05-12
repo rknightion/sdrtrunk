@@ -1,6 +1,6 @@
 /*
  * *****************************************************************************
- *  Copyright (C) 2014-2020 Dennis Sheirer
+ * Copyright (C) 2014-2026 Dennis Sheirer
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,17 +16,28 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  * ****************************************************************************
  */
-
-package io.github.dsheirer.gui.playlist;
-
-import io.github.dsheirer.gui.JavaFxWindowRequest;
+package io.github.dsheirer.module.discovery;
 
 /**
- * Request to view a facet of the playlist editor
+ * Lifecycle state of a Discovery row produced by BandScanController.
  */
-public abstract class PlaylistEditorRequest extends JavaFxWindowRequest
+public enum DiscoveryState
 {
-    public enum TabName {ALIAS, CHANNEL, DISCOVERY, PLAYLIST, RADIOREFERENCE, STREAM}
+    /** Energy was detected at this frequency but probing has not started yet. */
+    ENERGY_DETECTED,
 
-    public abstract TabName getTabName();
+    /** The SignalClassifier is actively probing this frequency. */
+    PROBING,
+
+    /** A decoder locked — bestDecoder and metadata are available. */
+    IDENTIFIED,
+
+    /** Energy was present but no decoder locked (or only partial). */
+    UNIDENTIFIED,
+
+    /** This frequency overlaps an already-configured channel in the playlist. */
+    KNOWN,
+
+    /** An unexpected error occurred during probing. */
+    ERROR
 }

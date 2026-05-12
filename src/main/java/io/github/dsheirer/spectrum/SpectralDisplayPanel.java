@@ -26,7 +26,10 @@ import io.github.dsheirer.controller.channel.ChannelProcessingManager;
 import io.github.dsheirer.dsp.filter.smoothing.SmoothingFilter.SmoothingType;
 import io.github.dsheirer.dsp.window.WindowType;
 import io.github.dsheirer.eventbus.MyEventBus;
+import io.github.dsheirer.gui.playlist.channel.ScanSpanRequest;
+import io.github.dsheirer.gui.playlist.channel.ShowDiscoveryRequest;
 import io.github.dsheirer.gui.playlist.channel.ViewChannelRequest;
+import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.playlist.PlaylistManager;
 import io.github.dsheirer.properties.SystemProperties;
 import io.github.dsheirer.sample.Listener;
@@ -47,13 +50,18 @@ import io.github.dsheirer.spectrum.menu.FFTWindowTypeItem;
 import io.github.dsheirer.spectrum.menu.FrameRateItem;
 import io.github.dsheirer.spectrum.menu.SmoothingItem;
 import io.github.dsheirer.spectrum.menu.SmoothingTypeItem;
+import java.awt.Color;
 import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.EventQueue;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.event.ComponentEvent;
 import java.awt.event.ComponentListener;
+import java.awt.event.InputEvent;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
 import java.util.ArrayList;
@@ -109,6 +117,15 @@ public class SpectralDisplayPanel extends JPanel
     private DiscoveredTunerModel mDiscoveredTunerModel;
     private Tuner mTuner;
 
+    /** Click-to-tune controller; null when not yet wired (feature disabled). */
+    private ClickToTuneController mClickToTuneController;
+
+    /** Pending-classification overlay; null until wired via {@link #setClickToTuneController}. */
+    private PendingClassificationOverlay mPendingOverlay;
+
+    /** Discovery overlay; null until wired via {@link #setDiscoveryModel}. */
+    private DiscoveryOverlay mDiscoveryOverlay;
+
     /**
      * Spectral Display Panel provides a frequency component display with a
      * historical waterfall display and a transparent overlay to show frequency,
@@ -135,6 +152,107 @@ public class SpectralDisplayPanel extends JPanel
         init();
 
         loadSettings();
+    }
+
+    /**
+     * Shows the pending-classification overlay at the given span.
+     * Delegates to {@link PendingClassificationOverlay#setPending}.
+     * No-op if the overlay is not yet installed.
+     *
+     * @param centerFreqHz centre frequency of the probed span, in Hz
+     * @param widthHz      estimated width of the probed span, in Hz
+     */
+    public void showPendingOverlay(long centerFreqHz, int widthHz)
+    {
+        if(mPendingOverlay != null)
+        {
+            mPendingOverlay.setPending(centerFreqHz, widthHz, mOverlayPanel);
+        }
+    }
+
+    /**
+     * Clears the pending-classification overlay.
+     * No-op if the overlay is not yet installed.
+     */
+    public void clearPendingOverlay()
+    {
+        if(mPendingOverlay != null)
+        {
+            mPendingOverlay.clear();
+        }
+    }
+
+    /**
+     * Wires in the click-to-tune controller and installs the pending-classification overlay
+     * on the {@link JLayeredPane} above the overlay panel.
+     *
+     * <p>May be called at any time after construction.  Calling it more than once replaces
+     * the previous controller and removes the old overlay.</p>
+     *
+     * @param controller the click-to-tune controller; must not be null
+     */
+    public void setClickToTuneController(ClickToTuneController controller)
+    {
+        // Remove the old overlay if present
+        if(mPendingOverlay != null)
+        {
+            mLayeredPanel.remove(mPendingOverlay);
+        }
+
+        mClickToTuneController = controller;
+
+        // Create and install the pending overlay
+        mPendingOverlay = new PendingClassificationOverlay(() -> mClickToTuneController.cancelPending());
+
+        // Place it above the OverlayPanel (layer 1) but below any other floating content
+        mLayeredPanel.add(mPendingOverlay, JLayeredPane.PALETTE_LAYER);
+
+        // Size it to match the layered pane
+        mPendingOverlay.setBounds(0, 0, mLayeredPanel.getWidth(), mLayeredPanel.getHeight());
+
+        mLayeredPanel.revalidate();
+    }
+
+    /**
+     * Wires in the discovery model and installs the {@link DiscoveryOverlay} on the
+     * {@link JLayeredPane} between the overlay panel and the pending-classification overlay.
+     *
+     * <p>Calling this method a second time disposes the old overlay and installs a new one
+     * (not expected in normal usage, but safe).</p>
+     *
+     * @param discoveryModel the model whose rows are painted; must not be null
+     * @param discoveryPreference preference controlling overlay visibility mode; must not be null
+     */
+    public void setDiscoveryModel(io.github.dsheirer.module.discovery.DiscoveryModel discoveryModel,
+                                   io.github.dsheirer.preference.discovery.DiscoveryPreference discoveryPreference)
+    {
+        // Remove the previous overlay if present
+        if(mDiscoveryOverlay != null)
+        {
+            mDiscoveryOverlay.dispose();
+            mLayeredPanel.remove(mDiscoveryOverlay);
+        }
+
+        mDiscoveryOverlay = new DiscoveryOverlay(discoveryModel, discoveryPreference, mOverlayPanel);
+
+        // Place it above the channel overlay panel (DEFAULT_LAYER / PALETTE_LAYER) but below the
+        // pending-classification overlay (PALETTE_LAYER).  Both overlays are paint-only
+        // (no mouse listeners) so relative Z-order does not affect event routing.
+        mLayeredPanel.add(mDiscoveryOverlay, JLayeredPane.POPUP_LAYER);
+        mDiscoveryOverlay.setBounds(0, 0, mLayeredPanel.getWidth(), mLayeredPanel.getHeight());
+
+        mLayeredPanel.revalidate();
+    }
+
+    /**
+     * Returns the current {@link DiscoveryOverlay}, or {@code null} if not yet installed.
+     * Used by the context menu to add the DiscoveryDisplay toggle.
+     *
+     * @return discovery overlay or null
+     */
+    public DiscoveryOverlay getDiscoveryOverlay()
+    {
+        return mDiscoveryOverlay;
     }
 
     private void loadSettings()
@@ -186,6 +304,12 @@ public class SpectralDisplayPanel extends JPanel
 
         mOverlayPanel.dispose();
         mOverlayPanel = null;
+
+        if(mDiscoveryOverlay != null)
+        {
+            mDiscoveryOverlay.dispose();
+            mDiscoveryOverlay = null;
+        }
 
         mTuner = null;
     }
@@ -481,6 +605,21 @@ public class SpectralDisplayPanel extends JPanel
     }
 
     /**
+     * Returns the {@link io.github.dsheirer.source.tuner.TunerController} of the currently
+     * displayed tuner, or {@code null} if no tuner is being displayed.
+     *
+     * <p>Used by the stepped-sweep survey to construct a
+     * {@link io.github.dsheirer.module.discovery.TunerControlImpl} that always targets
+     * whichever tuner the spectral display is currently showing.</p>
+     *
+     * @return the current tuner's controller, or {@code null}
+     */
+    public io.github.dsheirer.source.tuner.TunerController getTunerController()
+    {
+        return mTuner != null ? mTuner.getTunerController() : null;
+    }
+
+    /**
      * Monitors the sizing of the layered pane and resizes the spectrum and
      * channel panels whenever the layered pane is resized
      */
@@ -492,6 +631,16 @@ public class SpectralDisplayPanel extends JPanel
 
             mSpectrumPanel.setBounds(0, 0, c.getWidth(), c.getHeight());
             mOverlayPanel.setBounds(0, 0, c.getWidth(), c.getHeight());
+
+            if(mDiscoveryOverlay != null)
+            {
+                mDiscoveryOverlay.setBounds(0, 0, c.getWidth(), c.getHeight());
+            }
+
+            if(mPendingOverlay != null)
+            {
+                mPendingOverlay.setBounds(0, 0, c.getWidth(), c.getHeight());
+            }
         }
 
         @Override public void componentHidden(ComponentEvent arg0)
@@ -507,6 +656,51 @@ public class SpectralDisplayPanel extends JPanel
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Click-to-tune helper methods (package-private for unit testing)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Computes the midpoint frequency (Hz) between two x-pixel positions on the overlay panel.
+     *
+     * @param xLeft  left pixel coordinate
+     * @param xRight right pixel coordinate
+     * @return midpoint frequency in Hz
+     */
+    long midpointFrequency(int xLeft, int xRight)
+    {
+        long freqLeft  = mOverlayPanel.getFrequencyFromAxis(xLeft);
+        long freqRight = mOverlayPanel.getFrequencyFromAxis(xRight);
+        return (freqLeft + freqRight) / 2L;
+    }
+
+    /**
+     * Computes the frequency span (Hz) represented by a pixel range.
+     *
+     * @param xLeft  left pixel coordinate
+     * @param xRight right pixel coordinate
+     * @return span in Hz (always non-negative)
+     */
+    int pixelSpanToHz(int xLeft, int xRight)
+    {
+        long freqLeft  = mOverlayPanel.getFrequencyFromAxis(xLeft);
+        long freqRight = mOverlayPanel.getFrequencyFromAxis(xRight);
+        return (int) Math.abs(freqRight - freqLeft);
+    }
+
+    /**
+     * Returns true if the given x-pixel range is "non-trivial" (>= 10 pixels wide).
+     * Used to distinguish an intentional drag-select from an accidental mouse-jitter.
+     *
+     * @param xLeft  left pixel
+     * @param xRight right pixel
+     * @return true if |xRight - xLeft| >= 10
+     */
+    static boolean isNonTrivialDrag(int xLeft, int xRight)
+    {
+        return Math.abs(xRight - xLeft) >= 10;
+    }
+
     /**
      * Mouse event handler for the spectral display panel.
      */
@@ -515,6 +709,12 @@ public class SpectralDisplayPanel extends JPanel
         private int mDFTZoomWindowOffsetAtDragStart = 0;
         private int mDragStartX = 0;
         private double mPixelsPerBin;
+
+        // --- Shift+drag selection state ---
+        private boolean mShiftDragActive = false;
+        private int mSelectionStartX = 0;
+        private int mSelectionCurrentX = 0;
+        private SelectionOverlay mSelectionOverlay;
 
         public MouseEventProcessor()
         {
@@ -540,6 +740,25 @@ public class SpectralDisplayPanel extends JPanel
         {
             update(event);
 
+            if(mShiftDragActive)
+            {
+                // Shift+drag: update the live selection rectangle
+                mSelectionCurrentX = event.getX();
+
+                if(mSelectionOverlay != null)
+                {
+                    int xLeft  = Math.min(mSelectionStartX, mSelectionCurrentX);
+                    int xRight = Math.max(mSelectionStartX, mSelectionCurrentX);
+                    long midHz = midpointFrequency(xLeft, xRight);
+                    int  bwHz  = pixelSpanToHz(xLeft, xRight);
+
+                    mSelectionOverlay.update(xLeft, xRight, midHz, bwHz);
+                }
+
+                return; // don't pan while Shift is held
+            }
+
+            // Plain drag → pan
             int dragDistance = mDragStartX - event.getX();
 
             double binDistance = (double)dragDistance / mPixelsPerBin;
@@ -564,10 +783,57 @@ public class SpectralDisplayPanel extends JPanel
         @Override public void mousePressed(MouseEvent e)
         {
             mDragStartX = e.getX();
-
             mDFTZoomWindowOffsetAtDragStart = mDFTZoomWindowOffset;
-
             mPixelsPerBin = (double)getWidth() / ((double)(mDFTSize.getSize()) / (double)getZoomMultiplier());
+
+            // Start a Shift+drag selection if Shift is held AND left button pressed
+            // Gate on the overlay panel so waterfall coords don't mismatch spectrum coords
+            if(SwingUtilities.isLeftMouseButton(e)
+                && (e.getModifiersEx() & InputEvent.SHIFT_DOWN_MASK) != 0
+                && mClickToTuneController != null
+                && e.getComponent() == mOverlayPanel)
+            {
+                mShiftDragActive = true;
+                mSelectionStartX  = e.getX();
+                mSelectionCurrentX = e.getX();
+
+                if(mSelectionOverlay == null)
+                {
+                    mSelectionOverlay = new SelectionOverlay();
+                    mLayeredPanel.add(mSelectionOverlay, JLayeredPane.DRAG_LAYER);
+                    mSelectionOverlay.setBounds(0, 0,
+                        mLayeredPanel.getWidth(), mLayeredPanel.getHeight());
+                }
+
+                mSelectionOverlay.setVisible(true);
+                mSelectionOverlay.repaint();
+            }
+        }
+
+        @Override public void mouseReleased(MouseEvent e)
+        {
+            if(mShiftDragActive)
+            {
+                mShiftDragActive = false;
+
+                if(mSelectionOverlay != null)
+                {
+                    mSelectionOverlay.setVisible(false);
+                    mSelectionOverlay.repaint();
+                }
+
+                int xLeft  = Math.min(mSelectionStartX, e.getX());
+                int xRight = Math.max(mSelectionStartX, e.getX());
+
+                if(isNonTrivialDrag(xLeft, xRight) && mClickToTuneController != null)
+                {
+                    long midHz = midpointFrequency(xLeft, xRight);
+                    int  bwHz  = pixelSpanToHz(xLeft, xRight);
+
+                    // showPendingOverlay / clearPendingOverlay are called via UICallbacks
+                    mClickToTuneController.classifyAndTune(midHz, bwHz);
+                }
+            }
         }
 
         /**
@@ -605,10 +871,22 @@ public class SpectralDisplayPanel extends JPanel
         }
 
         /**
-         * Displays the context menu.
+         * Displays the context menu.  Also handles double-click for click-to-tune.
          */
         @Override public void mouseClicked(MouseEvent event)
         {
+            // Double-click (left button) → classify-and-tune at click frequency
+            if(SwingUtilities.isLeftMouseButton(event)
+                && event.getClickCount() == 2
+                && mClickToTuneController != null
+                && event.getComponent() == mOverlayPanel)
+            {
+                long freq = mOverlayPanel.getFrequencyFromAxis(event.getX());
+                // Pending overlay is shown via UICallbacks.showPending() inside classifyAndTune
+                mClickToTuneController.classifyAndTune(freq, 0);
+                return;
+            }
+
             if(SwingUtilities.isRightMouseButton(event))
             {
                 JPopupMenu contextMenu = new JPopupMenu();
@@ -632,12 +910,55 @@ public class SpectralDisplayPanel extends JPanel
                         viewChannel.addActionListener(
                                 e -> MyEventBus.getGlobalEventBus().post(new ViewChannelRequest(channel)));
                         channelMenu.add(viewChannel);
+
+                        // If this channel was created by click-to-tune, add decoder-change items
+                        if(mClickToTuneController != null
+                            && mClickToTuneController.getClickToTuneChannels().contains(channel))
+                        {
+                            JMenu changeDecoder = new JMenu("Change decoder");
+                            for(DecoderType type : DecoderType.PRIMARY_DECODERS)
+                            {
+                                JMenuItem decoderItem = new JMenuItem(type.getShortDisplayString());
+                                decoderItem.addActionListener(ev ->
+                                    mClickToTuneController.changeDecoder(channel, type));
+                                changeDecoder.add(decoderItem);
+                            }
+
+                            channelMenu.add(changeDecoder);
+
+                            JMenuItem redetect = new JMenuItem("Re-detect…");
+                            redetect.addActionListener(ev -> mClickToTuneController.redetect(channel));
+                            channelMenu.add(redetect);
+                        }
                     }
 
                     contextMenu.add(channelMenu);
 
                     if(!channels.isEmpty())
                     {
+                        contextMenu.add(new JSeparator());
+                    }
+
+                    // --- Click-to-tune items (only when controller is wired) ---
+                    if(mClickToTuneController != null)
+                    {
+                        JMenuItem autoDetect = new JMenuItem("Decode here (auto-detect)");
+                        final long clickFreq = frequency;
+                        // Pending overlay is shown via UICallbacks.showPending() inside classifyAndTune
+                        autoDetect.addActionListener(ev ->
+                            mClickToTuneController.classifyAndTune(clickFreq, 0));
+                        contextMenu.add(autoDetect);
+
+                        JMenu decodeAsMenu = new JMenu("Decode here as");
+                        for(DecoderType type : DecoderType.PRIMARY_DECODERS)
+                        {
+                            final DecoderType dt = type;
+                            JMenuItem item = new JMenuItem(type.getDisplayString());
+                            item.addActionListener(ev -> mClickToTuneController.tuneAs(clickFreq, dt));
+                            decodeAsMenu.add(item);
+                        }
+
+                        contextMenu.add(decodeAsMenu);
                         contextMenu.add(new JSeparator());
                     }
                 }
@@ -690,6 +1011,18 @@ public class SpectralDisplayPanel extends JPanel
                     channelDisplayMenu.add(new ChannelDisplayItem(mOverlayPanel, ChannelDisplay.NONE));
 
                     displayMenu.add(channelDisplayMenu);
+
+                    /**
+                     * Discovery Display setting menu (only shown when overlay is installed)
+                     */
+                    if(mDiscoveryOverlay != null)
+                    {
+                        JMenu discoveryDisplayMenu = new JMenu("Discovery");
+                        discoveryDisplayMenu.add(new DiscoveryDisplayItem(mDiscoveryOverlay, DiscoveryOverlay.DiscoveryDisplay.ALL));
+                        discoveryDisplayMenu.add(new DiscoveryDisplayItem(mDiscoveryOverlay, DiscoveryOverlay.DiscoveryDisplay.IDENTIFIED_ONLY));
+                        discoveryDisplayMenu.add(new DiscoveryDisplayItem(mDiscoveryOverlay, DiscoveryOverlay.DiscoveryDisplay.NONE));
+                        displayMenu.add(discoveryDisplayMenu);
+                    }
                 }
 
                 /**
@@ -782,6 +1115,30 @@ public class SpectralDisplayPanel extends JPanel
                     }
                 }
 
+                // --- Discovery / scan items (always present) ---
+                if(mClickToTuneController != null)
+                {
+                    contextMenu.add(new JSeparator());
+
+                    JMenuItem scanView = new JMenuItem("Scan this view…");
+                    scanView.addActionListener(ev -> {
+                        long minHz = mOverlayPanel.getMinFrequency();
+                        long maxHz = mOverlayPanel.getMaxFrequency();
+
+                        if(minHz > 0 && maxHz > minHz)
+                        {
+                            MyEventBus.getGlobalEventBus()
+                                .post(new ScanSpanRequest(minHz, maxHz));
+                        }
+                    });
+                    contextMenu.add(scanView);
+
+                    JMenuItem showDiscoveries = new JMenuItem("Show discoveries");
+                    showDiscoveries.addActionListener(ev ->
+                        MyEventBus.getGlobalEventBus().post(new ShowDiscoveryRequest()));
+                    contextMenu.add(showDiscoveries);
+                }
+
                 if(contextMenu != null)
                 {
                     if(event.getComponent() == mOverlayPanel)
@@ -793,6 +1150,66 @@ public class SpectralDisplayPanel extends JPanel
                         contextMenu.show(mWaterfallPanel, event.getX(), event.getY());
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * Lightweight Swing component that draws the live Shift+drag selection rectangle
+     * on the {@link JLayeredPane#DRAG_LAYER} during a selection drag.
+     */
+    private class SelectionOverlay extends JComponent
+    {
+        private static final long serialVersionUID = 1L;
+
+        private int mXLeft;
+        private int mXRight;
+        private long mMidHz;
+        private int mBwHz;
+
+        SelectionOverlay()
+        {
+            setOpaque(false);
+        }
+
+        void update(int xLeft, int xRight, long midHz, int bwHz)
+        {
+            mXLeft  = xLeft;
+            mXRight = xRight;
+            mMidHz  = midHz;
+            mBwHz   = bwHz;
+            repaint();
+        }
+
+        @Override
+        protected void paintComponent(Graphics g)
+        {
+            if(!isVisible() || mXRight <= mXLeft)
+            {
+                return;
+            }
+
+            Graphics2D g2 = (Graphics2D) g.create();
+
+            try
+            {
+                // Semi-transparent fill
+                g2.setColor(new Color(255, 200, 0, 50));
+                g2.fillRect(mXLeft, 0, mXRight - mXLeft, getHeight());
+
+                // Border
+                g2.setColor(new Color(255, 200, 0, 180));
+                g2.drawRect(mXLeft, 0, mXRight - mXLeft - 1, getHeight() - 1);
+
+                // Label: centre freq + width
+                String label = String.format(java.util.Locale.ROOT, "%.4f MHz  +/-%.1f kHz",
+                    mMidHz / 1e6, mBwHz / 2_000.0);
+                g2.setColor(new Color(255, 255, 200, 230));
+                g2.drawString(label, mXLeft + 4, 14);
+            }
+            finally
+            {
+                g2.dispose();
             }
         }
     }
@@ -895,6 +1312,41 @@ public class SpectralDisplayPanel extends JPanel
                         @Override public void run()
                         {
                             mOverlayPanel.setChannelDisplay(mChannelDisplay);
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    /**
+     * JCheckBoxMenuItem that toggles the per-session discovery overlay display mode.
+     */
+    public class DiscoveryDisplayItem extends JCheckBoxMenuItem
+    {
+        private static final long serialVersionUID = 1L;
+
+        private final DiscoveryOverlay mDiscoveryOverlay;
+        private final DiscoveryOverlay.DiscoveryDisplay mDisplay;
+
+        public DiscoveryDisplayItem(DiscoveryOverlay overlay, DiscoveryOverlay.DiscoveryDisplay display)
+        {
+            super(display.name());
+
+            mDiscoveryOverlay = overlay;
+            mDisplay = display;
+
+            setSelected(mDiscoveryOverlay.getDiscoveryDisplay() == mDisplay);
+
+            addActionListener(new ActionListener()
+            {
+                @Override public void actionPerformed(ActionEvent e)
+                {
+                    EventQueue.invokeLater(new Runnable()
+                    {
+                        @Override public void run()
+                        {
+                            mDiscoveryOverlay.setDiscoveryDisplay(mDisplay);
                         }
                     });
                 }

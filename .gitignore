@@ -33,3 +33,6 @@ gradle-app.setting
 
 # Cache of project
 .gradletasknamecache
+
+# Superpowers brainstorming scratch dir
+.superpowers/

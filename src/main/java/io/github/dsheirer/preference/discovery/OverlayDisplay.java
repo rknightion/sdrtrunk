@@ -1,6 +1,6 @@
 /*
  * *****************************************************************************
- *  Copyright (C) 2014-2020 Dennis Sheirer
+ * Copyright (C) 2014-2026 Dennis Sheirer
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,17 +16,19 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>
  * ****************************************************************************
  */
-
-package io.github.dsheirer.gui.playlist;
-
-import io.github.dsheirer.gui.JavaFxWindowRequest;
+package io.github.dsheirer.preference.discovery;
 
 /**
- * Request to view a facet of the playlist editor
+ * Controls which discovery results are painted on the spectral-display overlay.
  */
-public abstract class PlaylistEditorRequest extends JavaFxWindowRequest
+public enum OverlayDisplay
 {
-    public enum TabName {ALIAS, CHANNEL, DISCOVERY, PLAYLIST, RADIOREFERENCE, STREAM}
+    /** Show all discovery rows regardless of their outcome. */
+    ALL,
 
-    public abstract TabName getTabName();
+    /** Show only rows whose outcome is IDENTIFIED (a decoder locked). */
+    IDENTIFIED_ONLY,
+
+    /** Hide the discovery overlay entirely. */
+    NONE
 }

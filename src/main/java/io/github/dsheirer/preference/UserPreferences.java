@@ -24,6 +24,7 @@ import io.github.dsheirer.preference.application.ApplicationPreference;
 import io.github.dsheirer.preference.calibration.VectorCalibrationPreference;
 import io.github.dsheirer.preference.decoder.JmbeLibraryPreference;
 import io.github.dsheirer.preference.directory.DirectoryPreference;
+import io.github.dsheirer.preference.discovery.DiscoveryPreference;
 import io.github.dsheirer.preference.duplicate.CallManagementPreference;
 import io.github.dsheirer.preference.event.DecodeEventPreference;
 import io.github.dsheirer.preference.identifier.TalkgroupFormatPreference;
@@ -60,6 +61,7 @@ public class UserPreferences implements Listener<PreferenceType>
     private ChannelMultiFrequencyPreference mChannelMultiFrequencyPreference;
     private DecodeEventPreference mDecodeEventPreference;
     private DirectoryPreference mDirectoryPreference;
+    private DiscoveryPreference mDiscoveryPreference;
     private CallManagementPreference mCallManagementPreference;
     private JmbeLibraryPreference mJmbeLibraryPreference;
     private MP3Preference mMP3Preference;
@@ -114,6 +116,14 @@ public class UserPreferences implements Listener<PreferenceType>
     public DecodeEventPreference getDecodeEventPreference()
     {
         return mDecodeEventPreference;
+    }
+
+    /**
+     * Signal discovery and click-to-tune preferences
+     */
+    public DiscoveryPreference getDiscoveryPreference()
+    {
+        return mDiscoveryPreference;
     }
 
     /**
@@ -222,6 +232,7 @@ public class UserPreferences implements Listener<PreferenceType>
         mChannelMultiFrequencyPreference = new ChannelMultiFrequencyPreference(this::receive);
         mDecodeEventPreference = new DecodeEventPreference(this::receive);
         mDirectoryPreference = new DirectoryPreference(this::receive);
+        mDiscoveryPreference = new DiscoveryPreference(this::receive);
         mCallManagementPreference = new CallManagementPreference(this::receive);
         mJmbeLibraryPreference = new JmbeLibraryPreference(this::receive);
         mMP3Preference = new MP3Preference(this::receive);
