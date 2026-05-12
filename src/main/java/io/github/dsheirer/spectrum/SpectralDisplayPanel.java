@@ -235,8 +235,10 @@ public class SpectralDisplayPanel extends JPanel
 
         mDiscoveryOverlay = new DiscoveryOverlay(discoveryModel, discoveryPreference, mOverlayPanel);
 
-        // Place it above the channel overlay panel but below the pending-classification overlay
-        mLayeredPanel.add(mDiscoveryOverlay, JLayeredPane.MODAL_LAYER);
+        // Place it above the channel overlay panel (DEFAULT_LAYER / PALETTE_LAYER) but below the
+        // pending-classification overlay (PALETTE_LAYER).  Both overlays are paint-only
+        // (no mouse listeners) so relative Z-order does not affect event routing.
+        mLayeredPanel.add(mDiscoveryOverlay, JLayeredPane.POPUP_LAYER);
         mDiscoveryOverlay.setBounds(0, 0, mLayeredPanel.getWidth(), mLayeredPanel.getHeight());
 
         mLayeredPanel.revalidate();
@@ -302,6 +304,12 @@ public class SpectralDisplayPanel extends JPanel
 
         mOverlayPanel.dispose();
         mOverlayPanel = null;
+
+        if(mDiscoveryOverlay != null)
+        {
+            mDiscoveryOverlay.dispose();
+            mDiscoveryOverlay = null;
+        }
 
         mTuner = null;
     }

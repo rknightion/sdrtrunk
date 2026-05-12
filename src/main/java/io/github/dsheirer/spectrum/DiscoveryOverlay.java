@@ -18,8 +18,6 @@
  */
 package io.github.dsheirer.spectrum;
 
-import io.github.dsheirer.eventbus.MyEventBus;
-import io.github.dsheirer.gui.playlist.channel.ShowDiscoveryRequest;
 import io.github.dsheirer.module.discovery.Discovery;
 import io.github.dsheirer.module.discovery.DiscoveryEvent;
 import io.github.dsheirer.module.discovery.DiscoveryModel;
@@ -35,8 +33,6 @@ import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.Stroke;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
 import java.util.List;
 import javax.swing.JComponent;
 import javax.swing.SwingUtilities;
@@ -64,6 +60,11 @@ import org.slf4j.LoggerFactory;
  * running, or on whatever thread mutated the model in headless tests.  This overlay marshals
  * repaints to the Swing EDT via {@code SwingUtilities.invokeLater}.  The overlay reads the model
  * snapshot at paint time (on the EDT) — no locking needed because the EDT is single-threaded.
+ *
+ * <h3>Interactivity</h3>
+ * This component is intentionally <em>non-interactive</em>: it installs no mouse or key listeners.
+ * Pan, zoom, right-click, and click-to-tune events pass through to the underlying
+ * {@link OverlayPanel} unimpeded.
  *
  * <h3>Lifecycle</h3>
  * Call {@link #dispose()} when removing the overlay from the JLayeredPane to deregister the
@@ -130,28 +131,11 @@ public class DiscoveryOverlay extends JComponent
 
         setOpaque(false);
 
-        // Register a discovery listener that triggers a repaint on the EDT
+        // Register a discovery listener that triggers a repaint on the EDT.
+        // No mouse listeners are installed — this component is paint-only so that
+        // pan/zoom/right-click/click-to-tune events reach the underlying OverlayPanel.
         mDiscoveryListener = event -> SwingUtilities.invokeLater(this::repaint);
         mDiscoveryModel.addListener(mDiscoveryListener);
-
-        // Click → post ShowDiscoveryRequest for the closest discovery
-        addMouseListener(new MouseAdapter()
-        {
-            @Override
-            public void mouseClicked(MouseEvent e)
-            {
-                if(!SwingUtilities.isLeftMouseButton(e)) return;
-
-                long clickedFreq = mOverlayPanel.getFrequencyFromAxis(e.getX());
-                Discovery closest = findClosestDiscovery(clickedFreq);
-
-                if(closest != null)
-                {
-                    MyEventBus.getGlobalEventBus()
-                        .post(new ShowDiscoveryRequest(closest.getCenterFrequencyHz()));
-                }
-            }
-        });
     }
 
     // -------------------------------------------------------------------------
@@ -317,6 +301,7 @@ public class DiscoveryOverlay extends JComponent
     private boolean shouldShowDiscovery(Discovery discovery)
     {
         DiscoveryState state = discovery.getState();
+        if(state == null) return false;
 
         // IDENTIFIED_ONLY mode — show only IDENTIFIED rows
         if(mDiscoveryDisplay == DiscoveryDisplay.IDENTIFIED_ONLY
@@ -346,7 +331,9 @@ public class DiscoveryOverlay extends JComponent
 
     private static String makeLabel(Discovery discovery)
     {
-        return switch(discovery.getState())
+        DiscoveryState state = discovery.getState();
+        if(state == null) return "";
+        return switch(state)
         {
             case ENERGY_DETECTED -> "⚡";
             case PROBING         -> "…";
@@ -358,27 +345,4 @@ public class DiscoveryOverlay extends JComponent
         };
     }
 
-    private Discovery findClosestDiscovery(long clickedFreqHz)
-    {
-        Discovery closest = null;
-        long bestDelta = Long.MAX_VALUE;
-
-        for(Discovery d : mDiscoveryModel.snapshot())
-        {
-            if(d.getCreatedChannel() != null || !shouldShowDiscovery(d))
-            {
-                continue;
-            }
-
-            long delta = Math.abs(d.getCenterFrequencyHz() - clickedFreqHz);
-
-            if(delta < bestDelta)
-            {
-                bestDelta = delta;
-                closest = d;
-            }
-        }
-
-        return closest;
-    }
 }
