@@ -177,12 +177,26 @@ Finds energy peaks within a span, producing `List<EnergyPeak>`:
 record EnergyPeak(long centerFrequencyHz, int occupiedBandwidthHz, double powerDb, double snrDb)
 ```
 
-Two modes, picked by `BandScanController`:
+The survey taps the tuner's **full-rate wideband I/Q buffer** directly via
+`TunerControl.addWidebandSampleListener` — the same `INativeBuffer` stream the live
+`SpectralDisplayPanel` consumes.  This bypasses the polyphase channelizer entirely,
+so the survey works correctly on any tuner that is currently displayed, regardless of
+whether a wide-enough channelizer channel can be allocated.
 
-- **In‑band (non‑disruptive)** — the requested span ⊆ the tuner's current instantaneous bandwidth: attach a `DFTResultsConverter` listener to the running `ComplexDftProcessor` of the relevant `SpectralDisplayPanel` (a small new accessor exposes it, or the survey gets a dedicated short‑lived `ComplexDftProcessor` on a tap of the tuner's full output buffer — preferred, so survey FFT params are independent of display settings). Integrate (average) magnitude bins over a dwell (default ~3 s, `discovery.survey.dwell`), estimate the noise floor (e.g. median or a low percentile of bins), then find contiguous runs of bins exceeding `noiseFloor + threshold` (default ~6 dB, `discovery.survey.threshold.db`); each run → an `EnergyPeak` (center = run centroid, width = run span widened by a guard, power = peak bin, snr = peak − floor). Merge peaks closer than a min‑separation.
-- **Stepped sweep (disruptive)** — the span exceeds the tuner's instantaneous bandwidth: the operator confirmed a retune. The survey commandeers the tuner (or a dedicated discovery tuner if the operator has more than one — preference): for each step (step = ~80% of the tuner's max sample rate to overlap edges), retune, do a short in‑band survey, accumulate peaks, advance. On finish, restore the tuner to its prior center frequency. This *interrupts decoding on that tuner* for the duration — the dialog says so plainly, with an ETA.
+Two modes, chosen automatically by `SpectralSurvey` based on `span` vs `sampleRate`:
 
-The survey is cancellable and reports progress (fraction of span covered).
+- **In‑band (non‑disruptive)** — `span ≤ sampleRate`: registers a wideband listener,
+  accumulates Hann-windowed FFT frames over the dwell period without retuning, then detects
+  peaks via low-percentile noise floor estimation.  DC bins (±3 around center) are clamped to
+  −200 dBFS before peak detection to suppress the direct-conversion DC spike.  Results are
+  filtered to the operator's requested `[minHz, maxHz]` sub-span.
+- **Stepped sweep (disruptive)** — `span > sampleRate`: retunes across the span in overlapping
+  steps (stride = 85% of sample rate), collects peaks at each step, merges cross-step
+  duplicates, and **restores the original center frequency in a `finally` block** (including
+  on cancel and error).  This interrupts decoding on that tuner for the duration — the
+  `ScanDialog` warning banner says so plainly.
+
+The survey is cancellable and reports progress (fraction of dwell / span covered).
 
 ## 8. Component: `BandScanController` (auto‑discovery orchestration)
 
@@ -331,6 +345,7 @@ A P25 Phase 1 trunked system or a mix of NBFM/DMR conventional channels is ideal
 | 3. Press "Start". | Progress bar advances; table populates with detected signals. |
 | 4. Confirm the current tuner's center frequency is unchanged throughout. | Center frequency in the spectral display remains stable. |
 | 5. Press "Add" on an NBFM discovery. | A channel is added to the playlist and starts decoding immediately. |
+| 6. On an Airspy R2 (10 MHz sample rate), scan a 10 MHz span (e.g. 150–160 MHz). | The survey should complete as a single non-disruptive in-band survey with no retune (span = 10 MHz ≤ sampleRate = 10 MHz). The "disruption" warning banner should NOT appear. |
 
 ### 15.5  Wide stepped sweep (disruptive)
 
@@ -362,32 +377,27 @@ A P25 Phase 1 trunked system or a mix of NBFM/DMR conventional channels is ideal
 
 ## 16. Known Limitations and Future Work
 
-### 16.1  Stepped sweep — implemented and wired
+### 16.1  Stepped sweep — implemented (wideband tap)
 
-The stepped sweep is implemented in `SpectralSurvey.surveyWide()` and wired as an automatic
-fallback in `BandScanController.runSurvey()`: when the in-band survey fails because the span
-exceeds the tuner's instantaneous bandwidth, the controller retries automatically with
-`surveyWide()` provided a `TunerControl` is available.
+The stepped sweep is implemented in `SpectralSurvey` as the automatic path when
+`span > sampleRate`.  `BandScanController.runSurvey()` calls the single `survey()` method
+with the controller's `TunerControl`; the survey decides in-band vs stepped internally.
 
 **How it works:** `TunerControlImpl` is constructed in `SDRTrunk` with a
 `Supplier<TunerController>` bound to `SpectralDisplayPanel::getTunerController`.  This means
-the stepped sweep always commands whichever tuner the spectral display is currently showing,
-and `isAvailable()` returns `false` when no tuner is displayed (disabling the fallback).
+the survey always commands whichever tuner the spectral display is currently showing, and
+`isAvailable()` returns `false` when no tuner is displayed.  The wideband buffer tap
+(`addWidebandSampleListener`) bypasses the channelizer entirely.
 
-**Known disruption:** when `surveyWide()` steps the tuner's center frequency, any
+**Known disruption:** when the stepped path retunes the tuner's center frequency, any
 `TunerChannelSource` instances already allocated against that tuner will receive mistuned
 samples for the duration of each step.  This is documented in the `ScanDialog` warning banner
-("interrupts decoding on that tuner for the duration") and is expected behaviour.  The tuner
-center frequency is restored unconditionally in a `finally` block (including on cancel/error).
-Only the spectral display's currently-shown tuner is commandeered; other connected tuners are
-unaffected.
+and is expected behaviour.  The tuner center frequency is restored unconditionally in a
+`finally` block (including on cancel/error).  Only the spectral display's currently-shown
+tuner is affected; other connected tuners are unaffected.
 
-**DC-spike avoidance (known limitation):** the stepped sweep allocates a channelizer channel
-at each step's center frequency via `SurveySourceProvider.acquire()`.  On SDRs with a DC-spike
-avoidance zone (`MiddleUnusableBandwidth` — e.g. RTL-SDR, RSP), the small region around each
-step center is not surveyed because that frequency range maps to the channelizer's unusable
-band.  A future redesign could tap the tuner's raw wideband buffer directly instead of going
-through the channelizer, covering that region at the cost of higher complexity.
+**Single-tuner scanning only:** the band-scan controller uses one `TunerControl` and one
+`SpectralSurveyApi` instance.
 
 **Future work:** coordinate with `ChannelProcessingManager` to gracefully pause active
 channels before stepping and resume them after restoration.  This would require a new
