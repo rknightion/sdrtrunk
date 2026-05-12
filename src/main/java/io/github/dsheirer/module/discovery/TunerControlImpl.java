@@ -20,11 +20,19 @@ package io.github.dsheirer.module.discovery;
 
 import io.github.dsheirer.source.SourceException;
 import io.github.dsheirer.source.tuner.TunerController;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Production binding of {@link TunerControl} over a {@link TunerController}.
+ *
+ * <p>The constructor takes a {@link Supplier}{@code <TunerController>} so that
+ * {@link #isAvailable()} and every operation always operate on <em>whatever tuner the
+ * spectral display is currently showing</em>, even after the operator switches tuners.
+ * The supplier is queried on each call; it may return {@code null} if no tuner is
+ * currently displayed, in which case {@link #isAvailable()} returns {@code false} and
+ * any mutating call throws {@link IllegalStateException}.</p>
  *
  * <h3>Safety note</h3>
  * <p>Calling {@link #setCenterFreqHz} while the tuner has active
@@ -38,56 +46,82 @@ public class TunerControlImpl implements TunerControl
 {
     private static final Logger mLog = LoggerFactory.getLogger(TunerControlImpl.class);
 
-    private final TunerController mTunerController;
+    private final Supplier<TunerController> mControllerSupplier;
 
     /**
-     * Constructs the impl over the given controller.
+     * Constructs the impl with a supplier of the active tuner controller.
      *
-     * @param tunerController the underlying hardware controller; must not be null
+     * <p>The supplier is evaluated on each call so that this instance tracks
+     * whichever tuner the spectral display is currently showing.  A supplier
+     * that returns {@code null} means "no tuner currently selected".</p>
+     *
+     * @param controllerSupplier supplier for the current tuner controller; must not be null,
+     *                           but may return null when no tuner is displayed
      */
-    public TunerControlImpl(TunerController tunerController)
+    public TunerControlImpl(Supplier<TunerController> controllerSupplier)
     {
-        if(tunerController == null)
+        if(controllerSupplier == null)
         {
-            throw new IllegalArgumentException("tunerController must not be null");
+            throw new IllegalArgumentException("controllerSupplier must not be null");
         }
 
-        mTunerController = tunerController;
+        mControllerSupplier = controllerSupplier;
+    }
+
+    /**
+     * Returns the current tuner controller from the supplier, or {@code null} if none.
+     */
+    private TunerController controller()
+    {
+        return mControllerSupplier.get();
+    }
+
+    /**
+     * Returns the current tuner controller, throwing if none is available.
+     */
+    private TunerController requireController()
+    {
+        TunerController tc = mControllerSupplier.get();
+        if(tc == null)
+        {
+            throw new IllegalStateException("No tuner controller available (no tuner currently displayed)");
+        }
+        return tc;
     }
 
     @Override
     public long getCurrentCenterFreqHz()
     {
-        return mTunerController.getFrequency();
+        return requireController().getFrequency();
     }
 
     @Override
     public long getUsableBandwidthHz()
     {
-        return mTunerController.getUsableBandwidth();
+        return requireController().getUsableBandwidth();
     }
 
     @Override
     public long getMinFrequencyHz()
     {
-        return mTunerController.getMinimumFrequency();
+        return requireController().getMinimumFrequency();
     }
 
     @Override
     public long getMaxFrequencyHz()
     {
-        return mTunerController.getMaximumFrequency();
+        return requireController().getMaximumFrequency();
     }
 
     @Override
     public void setCenterFreqHz(long frequencyHz) throws SourceException
     {
-        mTunerController.setFrequency(frequencyHz);
+        requireController().setFrequency(frequencyHz);
     }
 
     @Override
     public boolean isAvailable()
     {
-        return true;
+        return controller() != null;
     }
 }

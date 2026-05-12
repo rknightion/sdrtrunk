@@ -55,11 +55,12 @@ import org.slf4j.LoggerFactory;
  * require a stepped (retuning) sweep.</p>
  *
  * <h3>Stepped-sweep warning</h3>
- * In Phase 4 the SDR tuner bandwidth is unknown from this dialog (no clean hook to reach the
- * live tuner's sample rate from a JavaFX dialog).  A static warning note is shown whenever the
- * span exceeds a conservative 2 MHz threshold — which is typical for RTL-SDR devices in their
- * narrower modes — advising the operator that wide scans need the stepped sweep, not yet available.
- * Phase 5 will wire the actual tuner bandwidth and compute a proper ETA.
+ * <p>A static warning banner is shown whenever the span exceeds a conservative 2 MHz threshold.
+ * The {@link BandScanController} automatically falls back to
+ * {@link io.github.dsheirer.module.discovery.SpectralSurveyApi#surveyWide} when the in-band
+ * survey cannot cover the requested span, stepping the spectral display's current tuner across
+ * the range.  The Scan button is never disabled — even for wide spans the sweep runs normally
+ * (provided a tuner is connected).</p>
  *
  * <h3>ETA / stepped computation</h3>
  * The static helper {@link #isLikelySteppedSweep(long, long)} is package-private for unit testing.
@@ -139,8 +140,10 @@ public class ScanDialog extends Stage
 
         // --- Stepped-sweep warning ---
         mSteppedWarningLabel = new Label(
-            "⚠  This range is wider than your SDR's bandwidth — it requires a stepped sweep "
-            + "that retunes the SDR and interrupts decoding.");
+            "⚠  This range is wider than your SDR can see at once. The scan will step the SDR "
+            + "across the range, which interrupts decoding on that tuner for the duration. "
+            + "Some SDRs may not see signals in the small region around each step's center "
+            + "frequency (DC-spike avoidance zone).");
         mSteppedWarningLabel.setWrapText(true);
         mSteppedWarningLabel.setStyle(
             "-fx-background-color: #cc3300; -fx-text-fill: white; "
@@ -359,8 +362,7 @@ public class ScanDialog extends Stage
             thresholdDb,
             maxSignals,
             continuous,
-            Duration.ofMinutes(intervalMinutes),
-            null); // null = in-band mode; a future improvement can pass a TunerControl for stepped sweep
+            Duration.ofMinutes(intervalMinutes));
 
         mLog.info("Starting band scan: {} – {} MHz, {} decoders, dwell {}s, threshold {}dB",
             String.format(Locale.ROOT, "%.3f", minMhz),

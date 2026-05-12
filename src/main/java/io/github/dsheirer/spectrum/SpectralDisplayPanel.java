@@ -605,6 +605,21 @@ public class SpectralDisplayPanel extends JPanel
     }
 
     /**
+     * Returns the {@link io.github.dsheirer.source.tuner.TunerController} of the currently
+     * displayed tuner, or {@code null} if no tuner is being displayed.
+     *
+     * <p>Used by the stepped-sweep survey to construct a
+     * {@link io.github.dsheirer.module.discovery.TunerControlImpl} that always targets
+     * whichever tuner the spectral display is currently showing.</p>
+     *
+     * @return the current tuner's controller, or {@code null}
+     */
+    public io.github.dsheirer.source.tuner.TunerController getTunerController()
+    {
+        return mTuner != null ? mTuner.getTunerController() : null;
+    }
+
+    /**
      * Monitors the sizing of the layered pane and resizes the spectrum and
      * channel panels whenever the layered pane is resized
      */

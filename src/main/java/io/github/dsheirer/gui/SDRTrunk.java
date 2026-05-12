@@ -47,18 +47,19 @@ import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.module.discovery.BandScanController;
 import io.github.dsheirer.module.discovery.Candidate;
 import io.github.dsheirer.module.discovery.ClassificationResult;
-import io.github.dsheirer.module.discovery.LockState;
 import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
 import io.github.dsheirer.module.discovery.DiscoveryModel;
+import io.github.dsheirer.module.discovery.LockState;
 import io.github.dsheirer.module.discovery.ProbeChainFactory;
 import io.github.dsheirer.module.discovery.SignalClassifier;
 import io.github.dsheirer.module.discovery.SourceProvider;
 import io.github.dsheirer.module.discovery.SpectralSurvey;
+import io.github.dsheirer.module.discovery.TunerControlImpl;
 import io.github.dsheirer.module.log.EventLogManager;
 import io.github.dsheirer.monitor.DiagnosticMonitor;
 import io.github.dsheirer.monitor.ResourceMonitor;
-import io.github.dsheirer.spectrum.ClickToTuneController;
 import io.github.dsheirer.playlist.PlaylistManager;
+import io.github.dsheirer.spectrum.ClickToTuneController;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.properties.SystemProperties;
 import io.github.dsheirer.record.AudioRecordingManager;
@@ -328,9 +329,9 @@ public class SDRTrunk implements Listener<TunerEvent>
 
                         // Collect candidates that reached a PARTIAL lock — we offer them as
                         // "start it anyway as X?" shortcuts in the miss popup.
-                        java.util.List<Candidate> partials = result.candidates().stream()
+                        List<Candidate> partials = result.candidates().stream()
                             .filter(c -> c.lockState() == LockState.PARTIAL)
-                            .collect(java.util.stream.Collectors.toList());
+                            .toList();
 
                         // Build the message body; if there are partial candidates, name them.
                         StringBuilder message = new StringBuilder();
@@ -421,6 +422,10 @@ public class SDRTrunk implements Listener<TunerEvent>
                 (config, spec, name) -> (ComplexSource) mTunerManager.getSource(config, spec, name),
                 mDiscoveryExecutor);
             mDiscoveryModel = new DiscoveryModel();
+            // Wire a TunerControlImpl that always resolves to whichever tuner the spectral
+            // display is currently showing — so the stepped sweep follows tuner switches.
+            TunerControlImpl tunerControl = new TunerControlImpl(mSpectralPanel::getTunerController);
+
             mBandScanController = new BandScanController(
                 mSignalClassifier,
                 mSpectralSurvey,
@@ -429,8 +434,9 @@ public class SDRTrunk implements Listener<TunerEvent>
                 mPlaylistManager.getChannelProcessingManager(),
                 channelFactory,
                 mUserPreferences,
-                mDiscoveryExecutor);
-            mLog.debug("Band-scan controller created (Phase 3)");
+                mDiscoveryExecutor,
+                tunerControl);
+            mLog.debug("Band-scan controller created (Phase 5 — stepped sweep wired)");
 
             // --- Phase 4: wire discovery model into spectral display and playlist editor ---
             mSpectralPanel.setDiscoveryModel(mDiscoveryModel, mUserPreferences.getDiscoveryPreference());
