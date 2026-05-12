@@ -18,24 +18,53 @@
  */
 package io.github.dsheirer.module.discovery;
 
+import io.github.dsheirer.sample.Listener;
+import io.github.dsheirer.sample.complex.ComplexSamples;
 import io.github.dsheirer.source.SourceException;
 
 /**
- * Narrow seam for the tuner operations needed by the stepped-sweep survey.
+ * Narrow seam for the tuner operations needed by the spectral survey.
  *
  * <p>The production binding is {@link TunerControlImpl}, which wraps a
  * {@link io.github.dsheirer.source.tuner.TunerController}.
- * Tests inject a {@link FakeTunerControl} that records calls without
+ * Tests inject a fake that records calls and feeds canned samples without
  * touching hardware.</p>
  *
  * <h3>Why this seam exists</h3>
- * <p>The stepped sweep needs to: query the current center frequency and
- * instantaneous bandwidth; retune the hardware; restore the prior frequency
- * on completion (or on error/cancel).  Wrapping these in a single interface
- * keeps {@link SpectralSurvey} testable without a real SDR device.</p>
+ * <p>The survey needs to: tap the tuner's full-rate wideband I/Q stream
+ * (the same stream the live spectrum display consumes); query the current
+ * center frequency, sample rate, and instantaneous usable bandwidth; and —
+ * for a stepped sweep — retune the hardware and restore the prior frequency
+ * afterwards.  Wrapping these in a single interface keeps {@link SpectralSurvey}
+ * testable without a real SDR device.</p>
  */
 public interface TunerControl
 {
+    /**
+     * Registers a listener for the tuner's full-rate wideband I/Q sample stream.
+     *
+     * <p>This is the same stream the live spectrum display taps.  Samples arrive
+     * on the tuner's delivery thread at the full sample rate ({@link #getCurrentSampleRateHz()}),
+     * not a narrowed polyphase-channelizer DDC channel.</p>
+     *
+     * @param listener listener to receive wideband samples; must not be null
+     */
+    void addWidebandSampleListener(Listener<ComplexSamples> listener);
+
+    /**
+     * Unregisters a previously-registered wideband sample listener.
+     *
+     * @param listener the listener to remove
+     */
+    void removeWidebandSampleListener(Listener<ComplexSamples> listener);
+
+    /**
+     * Returns the tuner's actual sample rate in Hz (e.g. {@code 10_000_000} for an Airspy R2).
+     *
+     * @return sample rate, Hz
+     */
+    double getCurrentSampleRateHz();
+
     /**
      * Returns the tuner's current center frequency in Hz.
      *
@@ -46,8 +75,8 @@ public interface TunerControl
     /**
      * Returns the tuner's current (instantaneous) usable bandwidth in Hz.
      *
-     * <p>This is the span the polyphase channelizer can serve without retuning;
-     * approximately {@code sampleRate * usableBandwidthPercentage}.</p>
+     * <p>This is the alias-free span the tuner serves; approximately
+     * {@code sampleRate * usableBandwidthPercentage}.</p>
      *
      * @return usable bandwidth, Hz
      */
@@ -73,8 +102,8 @@ public interface TunerControl
      * <p><b>Contract:</b> this method is disruptive — any active channel sources
      * on this tuner will see mistuned / corrupted samples until the caller
      * completes the sweep and calls {@link #setCenterFreqHz} again to restore
-     * the prior frequency.  The caller is responsible for ensuring that the
-     * operator has consented to this disruption before invoking the sweep.</p>
+     * the prior frequency.  The caller is responsible for ensuring the operator
+     * has consented to this disruption before invoking a stepped sweep.</p>
      *
      * @param frequencyHz desired center frequency in Hz
      * @throws SourceException if the hardware rejects the requested frequency
@@ -83,9 +112,9 @@ public interface TunerControl
 
     /**
      * Returns {@code true} if this control is connected to a real tuner that
-     * can be commanded.  The stepped sweep checks this before attempting to
-     * retune: if {@code false} the survey fails with a descriptive error rather
-     * than silently doing nothing.
+     * can be commanded.  The survey checks this before attempting a survey:
+     * if {@code false} the survey fails with a descriptive error rather than
+     * silently doing nothing.
      *
      * @return {@code true} if the underlying hardware is available
      */

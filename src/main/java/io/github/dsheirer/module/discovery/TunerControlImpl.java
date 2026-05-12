@@ -18,11 +18,15 @@
  */
 package io.github.dsheirer.module.discovery;
 
+import io.github.dsheirer.buffer.INativeBuffer;
+import io.github.dsheirer.sample.Listener;
+import io.github.dsheirer.sample.complex.ComplexSamples;
 import io.github.dsheirer.source.SourceException;
 import io.github.dsheirer.source.tuner.TunerController;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Production binding of {@link TunerControl} over a {@link TunerController}.
@@ -34,19 +38,28 @@ import org.slf4j.LoggerFactory;
  * currently displayed, in which case {@link #isAvailable()} returns {@code false} and
  * any mutating call throws {@link IllegalStateException}.</p>
  *
+ * <h3>Wideband tap</h3>
+ * <p>{@link #addWidebandSampleListener(Listener)} registers an adapter on the tuner
+ * controller's {@code addBufferListener} stream (the same {@link INativeBuffer} stream
+ * the live spectrum display consumes); the adapter iterates each native buffer into
+ * {@link ComplexSamples} and forwards them to the survey's listener.</p>
+ *
  * <h3>Safety note</h3>
  * <p>Calling {@link #setCenterFreqHz} while the tuner has active
- * {@code TunerChannelSource}s will cause those sources to receive samples at
- * the wrong frequency and produce corrupt decoded output until the caller
- * restores the original frequency.  The stepped sweep is only used after the
- * operator has explicitly confirmed the disruption via the {@code ScanDialog}
- * warning banner.</p>
+ * {@code TunerChannelSource}s will cause those sources to receive samples at the wrong
+ * frequency and produce corrupt decoded output until the caller restores the original
+ * frequency.  The stepped sweep is only used after the operator has explicitly confirmed
+ * the disruption via the {@code ScanDialog} warning banner.</p>
  */
 public class TunerControlImpl implements TunerControl
 {
-    private static final Logger mLog = LoggerFactory.getLogger(TunerControlImpl.class);
-
     private final Supplier<TunerController> mControllerSupplier;
+
+    /**
+     * Maps each survey-supplied {@link ComplexSamples} listener to the {@link INativeBuffer}
+     * adapter that was registered on the tuner controller for it, so it can be removed later.
+     */
+    private final Map<Listener<ComplexSamples>, Listener<INativeBuffer>> mAdapters = new ConcurrentHashMap<>();
 
     /**
      * Constructs the impl with a supplier of the active tuner controller.
@@ -87,6 +100,48 @@ public class TunerControlImpl implements TunerControl
             throw new IllegalStateException("No tuner controller available (no tuner currently displayed)");
         }
         return tc;
+    }
+
+    @Override
+    public void addWidebandSampleListener(Listener<ComplexSamples> listener)
+    {
+        if(listener == null)
+        {
+            throw new IllegalArgumentException("listener must not be null");
+        }
+
+        Listener<INativeBuffer> adapter = nativeBuffer ->
+        {
+            Iterator<ComplexSamples> it = nativeBuffer.iterator();
+            while(it.hasNext())
+            {
+                listener.receive(it.next());
+            }
+        };
+
+        mAdapters.put(listener, adapter);
+        requireController().addBufferListener(adapter);
+    }
+
+    @Override
+    public void removeWidebandSampleListener(Listener<ComplexSamples> listener)
+    {
+        Listener<INativeBuffer> adapter = mAdapters.remove(listener);
+
+        if(adapter != null)
+        {
+            TunerController tc = controller();
+            if(tc != null)
+            {
+                tc.removeBufferListener(adapter);
+            }
+        }
+    }
+
+    @Override
+    public double getCurrentSampleRateHz()
+    {
+        return requireController().getSampleRate();
     }
 
     @Override
