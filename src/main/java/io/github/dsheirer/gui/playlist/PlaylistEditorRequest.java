@@ -26,7 +26,7 @@ import io.github.dsheirer.gui.JavaFxWindowRequest;
  */
 public abstract class PlaylistEditorRequest extends JavaFxWindowRequest
 {
-    public enum TabName {ALIAS, CHANNEL, PLAYLIST, RADIOREFERENCE, STREAM}
+    public enum TabName {ALIAS, CHANNEL, DISCOVERY, PLAYLIST, RADIOREFERENCE, STREAM}
 
     public abstract TabName getTabName();
 }

@@ -392,6 +392,15 @@ public class SDRTrunk implements Listener<TunerEvent>
                 mUserPreferences,
                 mDiscoveryExecutor);
             mLog.debug("Band-scan controller created (Phase 3)");
+
+            // --- Phase 4: wire discovery model into spectral display and playlist editor ---
+            mSpectralPanel.setDiscoveryModel(mDiscoveryModel, mUserPreferences.getDiscoveryPreference());
+            if(mJavaFxWindowManager != null)
+            {
+                mJavaFxWindowManager.setBandScanController(mBandScanController);
+            }
+            // --- End Phase 4 wiring ---------------------------------------------
+
             // --- End band-scan controller -------------------------------------
         }
         // --- End click-to-tune controller --------------------------------------

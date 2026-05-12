@@ -69,7 +69,7 @@ public class PlaylistEditorApplication extends Application
     {
         if(mPlaylistEditor == null)
         {
-            mPlaylistEditor = new PlaylistEditor(mPlaylistManager, mTunerManager, mUserPreferences);
+            mPlaylistEditor = new PlaylistEditor(mPlaylistManager, mTunerManager, mUserPreferences, null);
         }
 
         return mPlaylistEditor;
