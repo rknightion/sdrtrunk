@@ -44,11 +44,14 @@ import io.github.dsheirer.icon.IconModel;
 import io.github.dsheirer.log.ApplicationLog;
 import io.github.dsheirer.map.MapService;
 import io.github.dsheirer.module.decode.DecoderType;
+import io.github.dsheirer.module.discovery.BandScanController;
 import io.github.dsheirer.module.discovery.ClassificationResult;
 import io.github.dsheirer.module.discovery.DiscoveryChannelFactory;
+import io.github.dsheirer.module.discovery.DiscoveryModel;
 import io.github.dsheirer.module.discovery.ProbeChainFactory;
 import io.github.dsheirer.module.discovery.SignalClassifier;
 import io.github.dsheirer.module.discovery.SourceProvider;
+import io.github.dsheirer.module.discovery.SpectralSurvey;
 import io.github.dsheirer.module.log.EventLogManager;
 import io.github.dsheirer.monitor.DiagnosticMonitor;
 import io.github.dsheirer.monitor.ResourceMonitor;
@@ -154,6 +157,9 @@ public class SDRTrunk implements Listener<TunerEvent>
     private TunerManager mTunerManager;
     private ExecutorService mDiscoveryExecutor;
     private SignalClassifier mSignalClassifier;
+    private SpectralSurvey mSpectralSurvey;
+    private DiscoveryModel mDiscoveryModel;
+    private BandScanController mBandScanController;
     private ApplicationLog mApplicationLog;
     private ResourceMonitor mResourceMonitor;
     private JFXPanel mResourceStatusPanel;
@@ -361,6 +367,23 @@ public class SDRTrunk implements Listener<TunerEvent>
             );
 
             mSpectralPanel.setClickToTuneController(clickToTuneController);
+
+            // --- Band-scan controller (Phase 3 — no UI yet) -------------------
+            mSpectralSurvey = new SpectralSurvey(
+                (config, spec, name) -> (ComplexSource) mTunerManager.getSource(config, spec, name),
+                mDiscoveryExecutor);
+            mDiscoveryModel = new DiscoveryModel();
+            mBandScanController = new BandScanController(
+                mSignalClassifier,
+                mSpectralSurvey,
+                mDiscoveryModel,
+                mPlaylistManager.getChannelModel(),
+                mPlaylistManager.getChannelProcessingManager(),
+                channelFactory,
+                mUserPreferences,
+                mDiscoveryExecutor);
+            mLog.debug("Band-scan controller created (Phase 3)");
+            // --- End band-scan controller -------------------------------------
         }
         // --- End click-to-tune controller --------------------------------------
 
@@ -770,6 +793,14 @@ public class SDRTrunk implements Listener<TunerEvent>
         mPlaylistManager.getChannelProcessingManager().shutdown();
         mAudioRecordingManager.stop();
         mResourceMonitor.stop();
+
+        // Shut down the band-scan controller first so it stops any running scan and
+        // releases its scheduler, then shut down the executor it uses.
+        if(mBandScanController != null)
+        {
+            mLog.info("Stopping band-scan controller ...");
+            mBandScanController.shutdown();
+        }
 
         // Shut down discovery executor BEFORE stopping the tuner manager so that any
         // in-flight probes release their TunerChannelSources before the channelizers tear down.
