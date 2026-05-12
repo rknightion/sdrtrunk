@@ -29,65 +29,36 @@ import java.util.concurrent.CompletableFuture;
  * Unit tests inject a fake implementation that returns canned {@link EnergyPeak} lists
  * without requiring a real tuner.</p>
  *
- * <h3>In-band vs stepped survey</h3>
+ * <h3>Survey strategy</h3>
+ * <p>The single {@link #survey} method decides upfront whether the requested span fits
+ * within the tuner's current sample rate:
  * <ul>
- *   <li>{@link #survey} — non-disruptive in-band survey; the span must fit within the
- *       tuner's instantaneous bandwidth.  Returns a failed future if the span is too wide.</li>
- *   <li>{@link #surveyWide} — stepped sweep; retunes the tuner across the span one
- *       stride at a time, restoring the original center frequency on completion (or on
- *       error/cancel).  Disruptive — only called after the operator confirms the dialog
- *       warning.</li>
+ *   <li><b>In-band (non-disruptive)</b> — span ≤ sample rate: accumulates FFT frames at the
+ *       tuner's current center without retuning.</li>
+ *   <li><b>Stepped (disruptive)</b> — span &gt; sample rate: retunes across the span one
+ *       stride at a time, restoring the original center on completion (or on error/cancel).</li>
  * </ul>
+ * In both cases the survey taps the tuner's full-rate wideband I/Q buffer directly
+ * (via {@link TunerControl#addWidebandSampleListener}), bypassing the polyphase channelizer.</p>
  */
 public interface SpectralSurveyApi
 {
     /**
-     * Performs an in-band spectral survey over the given frequency span.
+     * Performs a spectral survey over the given frequency span.
      *
-     * @param minHz       lower bound of the span in Hz (inclusive)
-     * @param maxHz       upper bound of the span in Hz (inclusive)
-     * @param dwell       how long to accumulate FFT frames
-     * @param thresholdDb SNR threshold in dB above estimated noise floor
-     * @param progress    progress listener (0.0..1.0); may be null
+     * <p>Requires a non-null, available {@link TunerControl}; completes exceptionally with a
+     * descriptive message if the tuner is unavailable.</p>
+     *
+     * @param minHz        lower bound of the span in Hz (inclusive)
+     * @param maxHz        upper bound of the span in Hz (inclusive)
+     * @param dwell        how long to accumulate FFT frames (total dwell; divided across steps for swept)
+     * @param thresholdDb  SNR threshold in dB above estimated noise floor
+     * @param progress     progress listener (0.0..1.0); may be null
+     * @param tunerControl control seam for the active tuner; must be non-null and available
      * @return cancellable future resolving to the list of detected peaks (never null, may be empty)
      */
     CompletableFuture<List<EnergyPeak>> survey(long minHz, long maxHz, Duration dwell,
                                                double thresholdDb,
-                                               SpectralSurvey.ProgressListener progress);
-
-    /**
-     * Performs a wide stepped-sweep survey over a span that exceeds the tuner's
-     * instantaneous bandwidth.
-     *
-     * <p>Steps the tuner's center frequency across the span at ~80% sample-rate
-     * strides (so adjacent steps overlap at the edges), runs an in-band mini-survey at
-     * each step, accumulates peaks, and restores the original center frequency in a
-     * {@code finally} block (even on cancel or error).</p>
-     *
-     * <p>The per-step dwell is {@code totalDwell / stepCount} (with a floor of 500 ms)
-     * so the aggregate observation time equals the caller-specified dwell regardless of
-     * how many steps are required.</p>
-     *
-     * <p>The default implementation throws {@link UnsupportedOperationException}.
-     * Test fakes that only exercise the in-band path need not override this method.
-     * {@link SpectralSurvey} provides the full implementation.</p>
-     *
-     * @param minHz        lower bound of the span in Hz (inclusive)
-     * @param maxHz        upper bound of the span in Hz (inclusive)
-     * @param dwell        total dwell budget for the whole sweep (divided equally across steps)
-     * @param thresholdDb  SNR threshold in dB above estimated noise floor
-     * @param tunerControl control seam used to read and set the tuner's center frequency
-     * @param progress     progress listener (0.0..1.0); may be null
-     * @return cancellable future resolving to the merged list of detected peaks (never null, may be empty)
-     */
-    default CompletableFuture<List<EnergyPeak>> surveyWide(long minHz, long maxHz, Duration dwell,
-                                                            double thresholdDb,
-                                                            TunerControl tunerControl,
-                                                            SpectralSurvey.ProgressListener progress)
-    {
-        CompletableFuture<List<EnergyPeak>> failed = new CompletableFuture<>();
-        failed.completeExceptionally(new UnsupportedOperationException(
-            "surveyWide not implemented by this SpectralSurveyApi instance"));
-        return failed;
-    }
+                                               SpectralSurvey.ProgressListener progress,
+                                               TunerControl tunerControl);
 }
