@@ -288,8 +288,12 @@ public class DiscoveryModel
     {
         if(Platform.isFxApplicationThread())
         {
-            // Already on FX thread: run inline (no lock needed — single-threaded for scene graph)
-            action.run();
+            // Already on FX thread: acquire mLock briefly so that background readers
+            // (snapshot / findOverlapping) cannot race a structural mutation.
+            synchronized(mLock)
+            {
+                action.run();
+            }
             return;
         }
 
@@ -297,7 +301,14 @@ public class DiscoveryModel
         // throws IllegalStateException — fall back to inline execution under mLock.
         try
         {
-            Platform.runLater(action);
+            // The runLater lambda must also acquire mLock when it fires on the FX thread,
+            // to stay consistent with the rule above.
+            Platform.runLater(() -> {
+                synchronized(mLock)
+                {
+                    action.run();
+                }
+            });
         }
         catch(IllegalStateException e)
         {

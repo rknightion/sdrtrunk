@@ -24,6 +24,7 @@ import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
 import io.github.dsheirer.preference.UserPreferences;
+import io.github.dsheirer.util.FxThreads;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -143,6 +144,12 @@ public class BandScanController
     /** The active scan request (null when idle). */
     private volatile ScanRequest mActiveScanRequest;
 
+    /**
+     * Descriptive message from the most recent error, or {@code null} if the last scan succeeded.
+     * Set when the scan body catches a survey or classification failure.
+     */
+    private volatile String mLastErrorMessage;
+
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
@@ -252,6 +259,19 @@ public class BandScanController
         return mProgress.get();
     }
 
+    /**
+     * Returns the descriptive error message from the most recent scan failure, or
+     * {@code null} if no error has occurred (or the controller is newly constructed).
+     *
+     * <p>The value is reset to {@code null} when a new scan starts successfully.</p>
+     *
+     * @return error message, or null
+     */
+    public String getLastErrorMessage()
+    {
+        return mLastErrorMessage;
+    }
+
     // -------------------------------------------------------------------------
     // Scan lifecycle
     // -------------------------------------------------------------------------
@@ -289,6 +309,7 @@ public class BandScanController
         int myEpoch = mCurrentEpoch.incrementAndGet();
 
         mActiveScanRequest = request;
+        mLastErrorMessage = null;
         // setState(SURVEYING) is deferred into runSurvey() so the survey future is
         // always stored in mActiveSurveyFuture before SURVEYING state is visible.
         setProgress(0.0);
@@ -376,7 +397,7 @@ public class BandScanController
         try
         {
             mChannelProcessingManager.start(channel);
-            discovery.setCreatedChannel(channel);
+            FxThreads.run(() -> discovery.setCreatedChannel(channel));
             mDiscoveryModel.update(discovery);
             mLog.info("Added channel '{}' for discovery at {} Hz", channel.getName(),
                 discovery.getCenterFrequencyHz());
@@ -448,7 +469,7 @@ public class BandScanController
             return;
         }
 
-        discovery.setWatched(watched);
+        FxThreads.run(() -> discovery.setWatched(watched));
         mDiscoveryModel.update(discovery);
     }
 
@@ -467,7 +488,7 @@ public class BandScanController
             return;
         }
 
-        discovery.setState(DiscoveryState.PROBING);
+        FxThreads.run(() -> discovery.setState(DiscoveryState.PROBING));
         mDiscoveryModel.update(discovery);
 
         try
@@ -504,7 +525,7 @@ public class BandScanController
                 {
                     mLog.warn("reprobe error for {} Hz: {}", discovery.getCenterFrequencyHz(),
                         e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
-                    discovery.setState(DiscoveryState.ERROR);
+                    FxThreads.run(() -> discovery.setState(DiscoveryState.ERROR));
                     mDiscoveryModel.update(discovery);
                 }
             });
@@ -512,7 +533,7 @@ public class BandScanController
         catch(RejectedExecutionException e)
         {
             mLog.warn("BandScanController: executor rejected reprobe — executor may be shut down");
-            discovery.setState(DiscoveryState.ERROR);
+            FxThreads.run(() -> discovery.setState(DiscoveryState.ERROR));
             mDiscoveryModel.update(discovery);
         }
     }
@@ -639,24 +660,29 @@ public class BandScanController
             if(existing != null)
             {
                 // Update the existing row's last-seen time and state
-                existing.setLastSeen(Instant.now());
+                Instant nowForExisting = Instant.now();
 
                 if(existing.getState() == DiscoveryState.UNIDENTIFIED)
                 {
                     if(existing.isWatched())
                     {
-                        // Re-probe watched unidentified rows
+                        // Re-probe watched unidentified rows; update last-seen on FX thread
+                        FxThreads.run(() -> existing.setLastSeen(nowForExisting));
                         toProbeLater.add(existing);
                     }
                     else
                     {
                         // Update state to ENERGY_DETECTED to reflect fresh energy
-                        existing.setState(DiscoveryState.ENERGY_DETECTED);
+                        FxThreads.run(() -> {
+                            existing.setLastSeen(nowForExisting);
+                            existing.setState(DiscoveryState.ENERGY_DETECTED);
+                        });
                         mDiscoveryModel.update(existing);
                     }
                 }
                 else
                 {
+                    FxThreads.run(() -> existing.setLastSeen(nowForExisting));
                     mDiscoveryModel.update(existing);
                 }
             }
@@ -666,7 +692,7 @@ public class BandScanController
                 if(isKnownChannel(peak))
                 {
                     Discovery discovery = new Discovery(peak, Instant.now());
-                    discovery.setState(DiscoveryState.KNOWN);
+                    FxThreads.run(() -> discovery.setState(DiscoveryState.KNOWN));
 
                     if(mCurrentEpoch.get() == myEpoch)
                     {
@@ -804,6 +830,8 @@ public class BandScanController
             }
 
             mLog.error("Spectral survey failed: {}", e.getMessage(), e);
+            mLastErrorMessage = e.getMessage() != null ? e.getMessage()
+                : (e.getCause() != null ? e.getCause().getMessage() : "Spectral survey failed");
             setState(ScanState.ERROR);
             return null;
         }
@@ -846,7 +874,7 @@ public class BandScanController
             // Check if an existing channel already covers this frequency
             if(isKnownChannel(peak))
             {
-                discovery.setState(DiscoveryState.KNOWN);
+                FxThreads.run(() -> discovery.setState(DiscoveryState.KNOWN));
                 mDiscoveryModel.add(discovery);
             }
             else
@@ -939,10 +967,10 @@ public class BandScanController
             return;
         }
 
-        discovery.setState(DiscoveryState.PROBING);
+        FxThreads.run(() -> discovery.setState(DiscoveryState.PROBING));
         mDiscoveryModel.update(discovery);
 
-        // Pass the operator's chosen decoder set through to the classifier (#2)
+        // Pass the operator's chosen decoder set through to the classifier
         ClassificationRequest req = ClassificationRequest.forFrequency(
             discovery.getCenterFrequencyHz(),
             discovery.getBandwidthHz(),
@@ -980,7 +1008,7 @@ public class BandScanController
             {
                 mLog.warn("Classification error for {} Hz: {}", discovery.getCenterFrequencyHz(),
                     e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
-                discovery.setState(DiscoveryState.ERROR);
+                FxThreads.run(() -> discovery.setState(DiscoveryState.ERROR));
                 mDiscoveryModel.update(discovery);
             }
         }
@@ -992,32 +1020,49 @@ public class BandScanController
 
     /**
      * Applies a {@link ClassificationResult} to a {@link Discovery}, updating all relevant fields.
+     * All JavaFX property mutations are marshalled to the FX Application Thread via
+     * {@link FxThreads#run(Runnable)}.
      */
     private void applyClassificationResult(Discovery discovery, ClassificationResult result)
     {
         if(result == null)
         {
-            discovery.setState(DiscoveryState.ERROR);
+            FxThreads.run(() -> discovery.setState(DiscoveryState.ERROR));
             return;
         }
 
-        discovery.setLastSeen(Instant.now());
+        Instant now = Instant.now();
 
         switch(result.outcome())
         {
             case IDENTIFIED ->
             {
-                discovery.setState(DiscoveryState.IDENTIFIED);
-                discovery.setDetectedDecoder(result.bestDecoder());
-                discovery.setKind(result.kind() != null ? result.kind() : SignalKind.UNKNOWN);
-                discovery.setConfidence(computeConfidence(result));
-                if(result.metadata() != null)
-                {
-                    discovery.setMetadata(result.metadata());
-                }
+                int confidence = computeConfidence(result);
+                SignalKind kind = result.kind() != null ? result.kind() : SignalKind.UNKNOWN;
+                java.util.Map<String, String> metadata = result.metadata();
+                FxThreads.run(() -> {
+                    discovery.setLastSeen(now);
+                    discovery.setState(DiscoveryState.IDENTIFIED);
+                    discovery.setDetectedDecoder(result.bestDecoder());
+                    discovery.setKind(kind);
+                    discovery.setConfidence(confidence);
+                    if(metadata != null)
+                    {
+                        discovery.setMetadata(metadata);
+                        discovery.bumpMetadataVersion();
+                    }
+                });
             }
-            case UNIDENTIFIED, NO_SIGNAL -> discovery.setState(DiscoveryState.UNIDENTIFIED);
-            case ERROR -> discovery.setState(DiscoveryState.ERROR);
+            case UNIDENTIFIED, NO_SIGNAL ->
+                FxThreads.run(() -> {
+                    discovery.setLastSeen(now);
+                    discovery.setState(DiscoveryState.UNIDENTIFIED);
+                });
+            case ERROR ->
+                FxThreads.run(() -> {
+                    discovery.setLastSeen(now);
+                    discovery.setState(DiscoveryState.ERROR);
+                });
             case CANCELLED ->
             {
                 // On cancellation, leave state as PROBING (scan was cancelled; row stays)
@@ -1117,19 +1162,23 @@ public class BandScanController
     }
 
     /**
-     * Sets the scan state property.  Called from background threads.
+     * Sets the scan state property on the FX Application Thread.
+     * Safe to call from any thread; uses {@link FxThreads#run(Runnable)} which runs
+     * inline on the FX thread or falls back to the calling thread in headless tests.
      */
     private void setState(ScanState state)
     {
-        mScanState.set(state);
+        FxThreads.run(() -> mScanState.set(state));
     }
 
     /**
-     * Sets the progress property.  Called from background threads.
+     * Sets the progress property on the FX Application Thread.
+     * Safe to call from any thread; uses {@link FxThreads#run(Runnable)} which runs
+     * inline on the FX thread or falls back to the calling thread in headless tests.
      */
     private void setProgress(double value)
     {
-        mProgress.set(value);
+        FxThreads.run(() -> mProgress.set(value));
     }
 
     /**
@@ -1199,7 +1248,7 @@ public class BandScanController
         {
             if(deleted.equals(d.getCreatedChannel()))
             {
-                d.setCreatedChannel(null);
+                FxThreads.run(() -> d.setCreatedChannel(null));
                 mDiscoveryModel.update(d);
                 break;
             }

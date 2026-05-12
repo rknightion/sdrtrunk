@@ -38,10 +38,11 @@ import javafx.beans.property.SimpleObjectProperty;
  * for every field following the convention used by {@link Channel}.</p>
  *
  * <h3>Threading</h3>
- * <p>Property mutations are performed by {@code BandScanController} on a background
- * executor thread.  When a JavaFX UI is bound in Phase 4, mutations should be marshalled
- * to the JavaFX Application Thread (via {@code Platform.runLater}) before calling setters.
- * This class itself adds no thread-marshalling; that responsibility belongs to the caller.</p>
+ * <p>All property mutations must be called on the JavaFX Application Thread.
+ * {@code BandScanController} wraps every setter call via {@link io.github.dsheirer.util.FxThreads#run},
+ * which marshals to the FX thread when the toolkit is running, or runs inline in headless tests.
+ * This ensures that {@code DiscoveryEditor} table bindings — which run on the FX thread — are
+ * always updated from the correct thread.</p>
  */
 public class Discovery
 {
@@ -59,6 +60,12 @@ public class Discovery
     private final ObjectProperty<Channel> mCreatedChannel = new SimpleObjectProperty<>(null);
     private final BooleanProperty mWatched = new SimpleBooleanProperty(false);
     private Map<String, String> mMetadata = new HashMap<>();
+
+    /**
+     * Monotonically-increasing counter incremented each time the metadata map is replaced.
+     * JavaFX columns can bind to this property to re-render Notes cells when metadata changes.
+     */
+    private final IntegerProperty mMetadataVersion = new SimpleIntegerProperty(0);
 
     /**
      * Constructs a Discovery from an energy peak.
@@ -428,13 +435,40 @@ public class Discovery
     }
 
     /**
-     * Replaces the metadata map.
+     * Replaces the metadata map.  Also increments the metadata-version counter so that
+     * JavaFX bindings on {@link #metadataVersionProperty()} detect the change and refresh.
      *
      * @param metadata new metadata map; if null, an empty map is stored
      */
     public void setMetadata(Map<String, String> metadata)
     {
         mMetadata = (metadata != null) ? metadata : new HashMap<>();
+        bumpMetadataVersion();
+    }
+
+    // -------------------------------------------------------------------------
+    // Observable property: metadataVersion
+    // -------------------------------------------------------------------------
+
+    /**
+     * JavaFX property whose value increments each time the metadata map is replaced.
+     * Bind table cell value factories to this property to trigger Notes-column refreshes
+     * when metadata changes.
+     *
+     * @return metadata-version property
+     */
+    public IntegerProperty metadataVersionProperty()
+    {
+        return mMetadataVersion;
+    }
+
+    /**
+     * Increments the metadata-version counter.  Called automatically by {@link #setMetadata}
+     * and may also be called externally when the map's contents are mutated in place.
+     */
+    public void bumpMetadataVersion()
+    {
+        mMetadataVersion.set(mMetadataVersion.get() + 1);
     }
 
     // -------------------------------------------------------------------------
