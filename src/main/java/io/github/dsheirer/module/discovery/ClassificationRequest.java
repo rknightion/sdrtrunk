@@ -101,7 +101,8 @@ public record ClassificationRequest(
     }
 
     /**
-     * Creates a classification request for the given frequency and approximate bandwidth.
+     * Creates a classification request for the given frequency and approximate bandwidth,
+     * using all {@link DecoderType#PRIMARY_DECODERS} as candidates.
      *
      * @param frequencyHz  center frequency to probe
      * @param bandwidthHz  approximate occupied bandwidth of the signal
@@ -114,6 +115,34 @@ public record ClassificationRequest(
             frequencyHz,
             bandwidthHz,
             EnumSet.copyOf(DecoderType.PRIMARY_DECODERS),
+            DEFAULT_DEADLINE,
+            false,
+            label
+        );
+    }
+
+    /**
+     * Creates a classification request for the given frequency, approximate bandwidth, and an
+     * explicit set of candidate decoders.  Use this overload when the operator or scan request
+     * has specified a non-default decoder set (e.g. {@link ScanRequest#candidateDecoders()}).
+     *
+     * @param frequencyHz        center frequency to probe
+     * @param bandwidthHz        approximate occupied bandwidth of the signal
+     * @param candidateDecoders  set of decoders to try; if null or empty, all primaries are used
+     * @param label              short label for logging
+     * @return a new {@link ClassificationRequest}
+     */
+    public static ClassificationRequest forFrequency(long frequencyHz, int bandwidthHz,
+                                                      EnumSet<DecoderType> candidateDecoders, String label)
+    {
+        EnumSet<DecoderType> decoders = (candidateDecoders == null || candidateDecoders.isEmpty())
+            ? EnumSet.copyOf(DecoderType.PRIMARY_DECODERS)
+            : EnumSet.copyOf(candidateDecoders);
+
+        return new ClassificationRequest(
+            frequencyHz,
+            bandwidthHz,
+            decoders,
             DEFAULT_DEADLINE,
             false,
             label

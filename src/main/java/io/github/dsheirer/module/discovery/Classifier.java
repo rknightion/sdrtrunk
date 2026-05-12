@@ -32,9 +32,17 @@ public interface Classifier
     /**
      * Classifies the signal described by the request.
      *
-     * <p>The returned future never completes exceptionally; all errors are encoded as
-     * {@link ClassificationOutcome#ERROR} results.  Calling {@code future.cancel(true)}
-     * interrupts the worker and produces a {@link ClassificationOutcome#CANCELLED} result.</p>
+     * <p>The returned future is cancellable.  Calling {@code future.cancel(true)} sets the
+     * future's cancelled state (via {@link java.util.concurrent.CompletableFuture#cancel
+     * super.cancel()}) and interrupts the worker thread; the future therefore completes in the
+     * cancelled state and any subsequent {@link java.util.concurrent.Future#get()} call on it
+     * throws {@link java.util.concurrent.CancellationException}.  It does <em>not</em> complete
+     * normally with a {@link ClassificationOutcome#CANCELLED} result — callers must catch
+     * {@link java.util.concurrent.CancellationException} (or check
+     * {@link java.util.concurrent.Future#isCancelled()}) rather than inspecting the result.</p>
+     *
+     * <p>When the future is <em>not</em> cancelled it never completes exceptionally; all errors
+     * are encoded as {@link ClassificationOutcome#ERROR} results.</p>
      *
      * @param request classification parameters
      * @return a future resolving to the classification result; cancellable
