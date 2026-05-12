@@ -122,7 +122,7 @@ public class DiscoveryPreference extends Preference
     // Lazy-cached fields (null = not yet loaded)
     // -------------------------------------------------------------------------
 
-    private Preferences mPreferences = Preferences.userNodeForPackage(DiscoveryPreference.class);
+    private final Preferences mPreferences;
 
     private Integer  mSurveyDwellSeconds;
     private Double   mEnergyThresholdDb;
@@ -139,13 +139,36 @@ public class DiscoveryPreference extends Preference
     // -------------------------------------------------------------------------
 
     /**
-     * Constructs this preference with an update listener.
+     * Constructs this preference with an update listener, backed by the default
+     * JVM user-preference node for this class.
      *
      * @param updateListener receives {@link PreferenceType#DISCOVERY} whenever a setting changes
      */
     public DiscoveryPreference(Listener<PreferenceType> updateListener)
     {
+        this(updateListener, Preferences.userNodeForPackage(DiscoveryPreference.class));
+    }
+
+    /**
+     * Constructs this preference with an update listener and a custom backing
+     * {@link Preferences} node.  Use this constructor in tests to supply a throwaway
+     * node so that the developer's real OS-level preference store is not touched.
+     *
+     * <pre>{@code
+     * // Example: isolated test node
+     * Preferences testNode = Preferences.userRoot().node("sdrtrunk-test-" + UUID.randomUUID());
+     * DiscoveryPreference prefs = new DiscoveryPreference(t -> {}, testNode);
+     * // ... test ...
+     * testNode.removeNode();
+     * }</pre>
+     *
+     * @param updateListener receives {@link PreferenceType#DISCOVERY} whenever a setting changes
+     * @param backingNode    the {@link Preferences} node to read from and write to
+     */
+    public DiscoveryPreference(Listener<PreferenceType> updateListener, Preferences backingNode)
+    {
         super(updateListener);
+        mPreferences = backingNode;
     }
 
     // -------------------------------------------------------------------------
