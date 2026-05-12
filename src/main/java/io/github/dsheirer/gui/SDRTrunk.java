@@ -222,6 +222,10 @@ public class SDRTrunk implements Listener<TunerEvent>
         mPlaylistManager = new PlaylistManager(mUserPreferences, mTunerManager, aliasModel, eventLogManager, mIconModel);
 
         // --- Signal Discovery Engine (Phase 1 — no UI yet) -------------------
+        // NOTE: mDiscoveryExecutor MUST remain an unbounded/cached pool.  BandScanController
+        // submits nested classification tasks from the outer scan thread; a fixed-size pool
+        // risks deadlock when all threads are blocked waiting for classify futures that are
+        // queued behind the waiting threads.
         mDiscoveryExecutor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r, "discovery-worker");
             t.setDaemon(true);
@@ -231,6 +235,11 @@ public class SDRTrunk implements Listener<TunerEvent>
             (ComplexSource) mTunerManager.getSource(config, spec, name);
         ProbeChainFactory probeChainFactory = new ProbeChainFactory(aliasModel,
             mPlaylistManager.getChannelMapModel(), mUserPreferences);
+        // SignalClassifier is constructed unconditionally (before the !headless gate)
+        // because ClickToTuneController and BandScanController are both constructed
+        // inside the !headless block and share this single classifier instance.
+        // SpectralSurvey, DiscoveryModel, and BandScanController are gated with !headless
+        // because they pair with the ClickToTuneController which is Swing/!headless-only.
         mSignalClassifier = new SignalClassifier(sourceProvider, probeChainFactory,
             mUserPreferences.getDiscoveryPreference(), mDiscoveryExecutor);
         // --- End Signal Discovery Engine -------------------------------------

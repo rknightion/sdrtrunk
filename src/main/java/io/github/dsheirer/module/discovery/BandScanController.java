@@ -24,19 +24,21 @@ import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
 import io.github.dsheirer.preference.UserPreferences;
-import io.github.dsheirer.source.config.SourceConfigTuner;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import javafx.beans.property.DoubleProperty;
 import javafx.beans.property.ObjectProperty;
@@ -51,7 +53,9 @@ import org.slf4j.LoggerFactory;
  * <h3>Scan lifecycle</h3>
  * <ol>
  *   <li>{@link #startScan(ScanRequest)} transitions state to {@code SURVEYING} and submits
- *       work to the executor.</li>
+ *       work to the executor.  If a scan is already running it is stopped first; the stop
+ *       is synchronised via an epoch counter (see §Thread safety below) so the old scan
+ *       cannot clobber the new one.</li>
  *   <li>The survey calls {@link SpectralSurveyApi#survey} to get energy peaks, populating
  *       {@link Discovery} rows in the {@link DiscoveryModel} as {@code ENERGY_DETECTED}.</li>
  *   <li>Peaks that overlap an ignore-range are silently dropped; peaks that overlap an already
@@ -68,10 +72,26 @@ import org.slf4j.LoggerFactory;
  * They interact with {@link ChannelModel} and {@link ChannelProcessingManager} directly on the
  * calling thread, mirroring the pattern in {@code ClickToTuneController}.</p>
  *
- * <h3>Threading</h3>
- * <p>The scan body runs on the shared discovery {@link ExecutorService}.
- * {@link DiscoveryModel} mutations happen on that background thread.
- * Phase 4 must marshal them to the JavaFX Application Thread before binding a UI.</p>
+ * <h3>Thread safety — epoch / generation counter</h3>
+ * <p>A monotonically-increasing epoch ({@link AtomicInteger}) guards against stale scan
+ * iterations mutating the model after a new scan has started.  Every scan / rescan captures its
+ * epoch at start ({@code myEpoch}) and checks {@code myEpoch == mCurrentEpoch.get()} at every
+ * loop iteration and before each model mutation.  {@link #stopInternal} and
+ * {@link #startScan} bump the epoch, making all in-flight work detect "stale" and exit cleanly
+ * without touching the model.  This replaces the previous shared {@code mCancelled} boolean
+ * (kept for legacy compatibility but only set/cleared in tandem with epoch bumps).</p>
+ *
+ * <h3>DiscoveryModel thread safety</h3>
+ * <p>As of Phase 3 {@link DiscoveryModel} marshals all mutations to the JavaFX Application Thread
+ * when the FX toolkit is running, and runs inline under its internal lock otherwise.  Callers
+ * (including this class and Phase 4) may call any {@link DiscoveryModel} method from any thread
+ * without additional marshalling.</p>
+ *
+ * <h3>Note on the executor</h3>
+ * <p>{@code mExecutor} must be an unbounded / cached pool because the scan body submits nested
+ * tasks (one per {@link #probeOne} classification) while holding the outer scan thread.
+ * A fixed-size pool risks deadlock if all threads are waiting for classify futures that are
+ * queued behind the waiting threads.</p>
  */
 public class BandScanController
 {
@@ -95,6 +115,15 @@ public class BandScanController
     /** The currently running scan future (null when idle). */
     private final AtomicReference<Future<?>> mActiveScanFuture = new AtomicReference<>();
 
+    /**
+     * The survey future currently running (set in {@link #startScanBody} and
+     * {@link #rescanBody}, cleared when the survey completes or is cancelled).
+     * Cancelling this future from {@link #stopInternal} releases the survey's
+     * tuner source promptly rather than waiting for the dwell to expire.
+     */
+    private final AtomicReference<CompletableFuture<List<EnergyPeak>>> mActiveSurveyFuture =
+        new AtomicReference<>();
+
     /** The currently running classification future (null when not probing). */
     private final AtomicReference<CompletableFuture<ClassificationResult>> mActiveClassifyFuture =
         new AtomicReference<>();
@@ -102,8 +131,11 @@ public class BandScanController
     /** Set when shutdown() has been called; no further startScan calls are accepted. */
     private final AtomicBoolean mShutdown = new AtomicBoolean(false);
 
-    /** Cancellation flag checked by the running scan body. */
-    private final AtomicBoolean mCancelled = new AtomicBoolean(false);
+    /**
+     * Monotonically-increasing generation counter.  Bumped by {@link #stopInternal} and
+     * {@link #startScan} so in-flight scan bodies detect stale state and exit.
+     */
+    private final AtomicInteger mCurrentEpoch = new AtomicInteger(0);
 
     /** Scheduled continuous re-survey future; cancelled by stop(). */
     private final AtomicReference<ScheduledFuture<?>> mContinuousSchedule = new AtomicReference<>();
@@ -120,12 +152,15 @@ public class BandScanController
      *
      * @param classifier              signal classification engine
      * @param spectralSurvey          spectral survey engine
-     * @param discoveryModel          model that receives discovered signals
+     * @param discoveryModel          model that receives discovered signals; all methods are
+     *                                safe to call from any thread (thread-safety is owned by the model)
      * @param channelModel            model for playlist channels (read for KNOWN check; write for addAsChannel)
      * @param channelProcessingManager manager that starts/stops channels
      * @param discoveryChannelFactory factory that builds {@link Channel} instances from discoveries
      * @param userPreferences         preference bag (ignore list, thresholds, etc.)
-     * @param executor                shared discovery executor
+     * @param executor                shared discovery executor — must be an unbounded/cached pool
+     *                                because the scan body submits nested classification tasks while
+     *                                blocking on the outer scan thread
      */
     public BandScanController(Classifier classifier,
                                SpectralSurveyApi spectralSurvey,
@@ -215,6 +250,10 @@ public class BandScanController
      * the {@link DiscoveryModel} — the operator can call {@link DiscoveryModel#clear()} if
      * desired).  Does nothing if {@link #shutdown()} has been called.</p>
      *
+     * <p>Rejection policy: if the executor is shut down when the scan body is submitted,
+     * the new scan is abandoned gracefully (state stays at the current value rather than
+     * hanging).</p>
+     *
      * @param request the scan parameters; must not be null
      */
     public void startScan(ScanRequest request)
@@ -230,16 +269,27 @@ public class BandScanController
             return;
         }
 
-        // Cancel any in-progress scan
+        // Bump the epoch to invalidate any currently running scan / rescan.
+        // stopInternal sets CANCELLED; we immediately re-arm mCurrentEpoch to the new value.
         stopInternal(false);
 
-        mCancelled.set(false);
+        int myEpoch = mCurrentEpoch.incrementAndGet();
+
         mActiveScanRequest = request;
-        setState(ScanState.SURVEYING);
+        // setState(SURVEYING) is deferred into runSurvey() so the survey future is
+        // always stored in mActiveSurveyFuture before SURVEYING state is visible.
         setProgress(0.0);
 
-        Future<?> scanFuture = mExecutor.submit(() -> runScan(request));
-        mActiveScanFuture.set(scanFuture);
+        try
+        {
+            Future<?> scanFuture = mExecutor.submit(() -> runScan(request, myEpoch));
+            mActiveScanFuture.set(scanFuture);
+        }
+        catch(RejectedExecutionException e)
+        {
+            mLog.warn("BandScanController: executor rejected scan submission — executor may be shut down");
+            setState(ScanState.ERROR);
+        }
     }
 
     /**
@@ -407,106 +457,367 @@ public class BandScanController
         discovery.setState(DiscoveryState.PROBING);
         mDiscoveryModel.update(discovery);
 
-        mExecutor.submit(() -> {
-            ClassificationRequest req = ClassificationRequest.forFrequency(
-                discovery.getCenterFrequencyHz(),
-                discovery.getBandwidthHz(),
-                "reprobe@" + discovery.getCenterFrequencyHz());
+        try
+        {
+            mExecutor.submit(() -> {
+                ClassificationRequest req = ClassificationRequest.forFrequency(
+                    discovery.getCenterFrequencyHz(),
+                    discovery.getBandwidthHz(),
+                    // Use all primaries for reprobe (no scan request in scope)
+                    null,
+                    "reprobe@" + discovery.getCenterFrequencyHz());
 
-            CompletableFuture<ClassificationResult> future = mClassifier.classify(req);
+                CompletableFuture<ClassificationResult> future = mClassifier.classify(req);
 
-            try
-            {
-                ClassificationResult result = future.get();
-                applyClassificationResult(discovery, result);
-                mDiscoveryModel.update(discovery);
-            }
-            catch(InterruptedException e)
-            {
-                Thread.currentThread().interrupt();
-                mLog.debug("reprobe interrupted for {} Hz", discovery.getCenterFrequencyHz());
-            }
-            catch(ExecutionException e)
-            {
-                mLog.warn("reprobe error for {} Hz: {}", discovery.getCenterFrequencyHz(),
-                    e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
-                discovery.setState(DiscoveryState.ERROR);
-                mDiscoveryModel.update(discovery);
-            }
-        });
+                try
+                {
+                    ClassificationResult result = future.get();
+                    applyClassificationResult(discovery, result);
+                    mDiscoveryModel.update(discovery);
+                }
+                catch(CancellationException e)
+                {
+                    // Cancelled (e.g. shutdown) — leave discovery in PROBING state
+                    mLog.debug("reprobe cancelled for {} Hz", discovery.getCenterFrequencyHz());
+                }
+                catch(InterruptedException e)
+                {
+                    // Restore interrupted flag; leave discovery in PROBING state
+                    mLog.debug("reprobe interrupted for {} Hz", discovery.getCenterFrequencyHz());
+                    // Do NOT re-interrupt: this thread returns to the pool; re-setting the flag
+                    // would propagate the interrupt into the pool's housekeeping.
+                }
+                catch(ExecutionException e)
+                {
+                    mLog.warn("reprobe error for {} Hz: {}", discovery.getCenterFrequencyHz(),
+                        e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+                    discovery.setState(DiscoveryState.ERROR);
+                    mDiscoveryModel.update(discovery);
+                }
+            });
+        }
+        catch(RejectedExecutionException e)
+        {
+            mLog.warn("BandScanController: executor rejected reprobe — executor may be shut down");
+            discovery.setState(DiscoveryState.ERROR);
+            mDiscoveryModel.update(discovery);
+        }
     }
 
     // -------------------------------------------------------------------------
     // Core scan body (runs on executor thread)
     // -------------------------------------------------------------------------
 
-    private void runScan(ScanRequest request)
+    private void runScan(ScanRequest request, int myEpoch)
     {
         try
         {
-            doRunScan(request);
+            startScanBody(request, myEpoch);
         }
         catch(Throwable t)
         {
-            mLog.error("Unexpected error in band scan", t);
-            setState(ScanState.ERROR);
+            if(mCurrentEpoch.get() == myEpoch)
+            {
+                mLog.error("Unexpected error in band scan", t);
+                setState(ScanState.ERROR);
+            }
         }
     }
 
-    private void doRunScan(ScanRequest request)
+    /**
+     * Body of a single scan pass (initial scan and continuous-rescan share the probe loop
+     * via {@link #runProbeLoop}).
+     */
+    private void startScanBody(ScanRequest request, int myEpoch)
     {
         // --- Step 1: Spectral survey ------------------------------------------
-        setState(ScanState.SURVEYING);
+        // NOTE: setState(SURVEYING) is deferred to inside runSurvey(), after
+        // mActiveSurveyFuture is set, so that any observer of the SURVEYING state
+        // can rely on the survey future already being available for cancellation.
         setProgress(0.0);
 
-        CompletableFuture<List<EnergyPeak>> surveyFuture = mSpectralSurvey.survey(
-            request.minFrequencyHz(),
-            request.maxFrequencyHz(),
-            request.surveyDwell(),
-            request.thresholdDb(),
-            fraction -> setProgress(fraction * 0.5));  // survey = first 50% of progress
+        List<EnergyPeak> peaks = runSurvey(request, myEpoch, 0.0, 0.5);
 
-        List<EnergyPeak> peaks;
+        if(peaks == null)
+        {
+            // Epoch stale, cancelled, or survey error — runSurvey already set state
+            return;
+        }
 
+        // --- Steps 2-3: Ignore/known filter + probing -------------------------
+        runProbeLoop(request, myEpoch, peaks, true);
+
+        if(mCurrentEpoch.get() != myEpoch)
+        {
+            return;
+        }
+
+        setProgress(1.0);
+
+        // --- Step 4: Finished or schedule continuous re-scan ------------------
+        if(request.continuous())
+        {
+            setState(ScanState.IDLE_CONTINUOUS);
+            scheduleRescan(request, myEpoch);
+        }
+        else
+        {
+            setState(ScanState.DONE);
+        }
+    }
+
+    /**
+     * Runs one continuous re-scan cycle on the executor (submitted from the scheduler so
+     * the scheduler thread is never blocked by long-running work).
+     */
+    private void runRescan(ScanRequest request, int myEpoch)
+    {
         try
         {
-            peaks = surveyFuture.get();
+            rescanBody(request, myEpoch);
         }
-        catch(InterruptedException e)
+        catch(Throwable t)
         {
-            Thread.currentThread().interrupt();
-            setState(ScanState.CANCELLED);
-            return;
-        }
-        catch(Exception e)
-        {
-            if(mCancelled.get())
+            if(mCurrentEpoch.get() == myEpoch)
             {
-                setState(ScanState.CANCELLED);
-                return;
+                mLog.error("Unexpected error in continuous re-scan", t);
+                setState(ScanState.ERROR);
             }
-
-            mLog.error("Spectral survey failed: {}", e.getMessage(), e);
-            setState(ScanState.ERROR);
-            return;
         }
+    }
 
-        if(mCancelled.get())
+    private void rescanBody(ScanRequest request, int myEpoch)
+    {
+        if(mCurrentEpoch.get() != myEpoch || mShutdown.get())
         {
-            setState(ScanState.CANCELLED);
             return;
         }
 
-        // --- Step 2: Classify energy detected vs KNOWN, add rows -------------
+        // setState(SURVEYING) is deferred to inside runSurvey() so mActiveSurveyFuture
+        // is always set before the state is published (see runSurvey javadoc).
+        setProgress(0.0);
+
+        List<EnergyPeak> peaks = runSurvey(request, myEpoch, 0.0, 0.5);
+
+        if(peaks == null)
+        {
+            return;
+        }
+
         setState(ScanState.PROBING);
 
         List<Discovery> toProbeLater = new ArrayList<>();
 
         for(EnergyPeak peak : peaks)
         {
-            if(mCancelled.get())
+            if(mCurrentEpoch.get() != myEpoch)
+            {
+                return;
+            }
+
+            if(isIgnored(peak))
+            {
+                continue;
+            }
+
+            // Try to match an existing row by approximate frequency
+            Discovery existing = findExistingDiscovery(peak);
+
+            if(existing != null)
+            {
+                // Update the existing row's last-seen time and state
+                existing.setLastSeen(Instant.now());
+
+                if(existing.getState() == DiscoveryState.UNIDENTIFIED)
+                {
+                    if(existing.isWatched())
+                    {
+                        // Re-probe watched unidentified rows
+                        toProbeLater.add(existing);
+                    }
+                    else
+                    {
+                        // Update state to ENERGY_DETECTED to reflect fresh energy
+                        existing.setState(DiscoveryState.ENERGY_DETECTED);
+                        mDiscoveryModel.update(existing);
+                    }
+                }
+                else
+                {
+                    mDiscoveryModel.update(existing);
+                }
+            }
+            else
+            {
+                // Brand new peak
+                if(isKnownChannel(peak))
+                {
+                    Discovery discovery = new Discovery(peak, Instant.now());
+                    discovery.setState(DiscoveryState.KNOWN);
+
+                    if(mCurrentEpoch.get() == myEpoch)
+                    {
+                        mDiscoveryModel.add(discovery);
+                    }
+                }
+                else
+                {
+                    Discovery discovery = new Discovery(peak, Instant.now());
+
+                    if(mCurrentEpoch.get() == myEpoch)
+                    {
+                        mDiscoveryModel.add(discovery);
+                        toProbeLater.add(discovery);
+                    }
+                }
+            }
+        }
+
+        // Also re-probe any watched+UNIDENTIFIED rows that did NOT appear in the survey
+        // (the signal may be intermittent — keep trying as long as the operator watches it)
+        for(Discovery d : new ArrayList<>(mDiscoveryModel.getDiscoveries()))
+        {
+            if(d.isWatched() && d.getState() == DiscoveryState.UNIDENTIFIED
+                && !toProbeLater.contains(d))
+            {
+                toProbeLater.add(d);
+            }
+        }
+
+        // Sequential probing for new/watched discoveries
+        int probeLimit = (request.maxSignalsToProbe() > 0) ? request.maxSignalsToProbe() : Integer.MAX_VALUE;
+        int probeCount = 0;
+
+        for(Discovery discovery : toProbeLater)
+        {
+            if(mCurrentEpoch.get() != myEpoch)
+            {
+                return;
+            }
+
+            if(probeCount >= probeLimit)
+            {
+                break;
+            }
+
+            probeOne(discovery, request, myEpoch);
+            probeCount++;
+        }
+
+        if(mCurrentEpoch.get() != myEpoch)
+        {
+            return;
+        }
+
+        setProgress(1.0);
+        setState(ScanState.IDLE_CONTINUOUS);
+        scheduleRescan(request, myEpoch);
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared helpers for scan body
+    // -------------------------------------------------------------------------
+
+    /**
+     * Runs the spectral survey phase.  Returns the peak list on success, or {@code null} if
+     * the epoch became stale, the survey was cancelled, or a fatal error occurred (in each
+     * case the appropriate state has already been set).
+     *
+     * @param request          the active scan request
+     * @param myEpoch          the epoch of the current scan pass
+     * @param progressStart    the progress fraction at the start of the survey (0.0..1.0)
+     * @param progressEnd      the progress fraction at the end of the survey (0.0..1.0)
+     * @return the list of energy peaks, or {@code null} to signal "stop"
+     */
+    private List<EnergyPeak> runSurvey(ScanRequest request, int myEpoch,
+                                        double progressStart, double progressEnd)
+    {
+        double progressRange = progressEnd - progressStart;
+
+        // Obtain the future BEFORE publishing SURVEYING state so that any thread that
+        // observes SURVEYING can rely on mActiveSurveyFuture already being set for cancellation.
+        CompletableFuture<List<EnergyPeak>> surveyFuture = mSpectralSurvey.survey(
+            request.minFrequencyHz(),
+            request.maxFrequencyHz(),
+            request.surveyDwell(),
+            request.thresholdDb(),
+            fraction -> setProgress(progressStart + fraction * progressRange));
+
+        // Store before publishing state
+        mActiveSurveyFuture.set(surveyFuture);
+
+        // Now publish SURVEYING — at this point mActiveSurveyFuture is visible to stop()
+        setState(ScanState.SURVEYING);
+
+        try
+        {
+            List<EnergyPeak> peaks = surveyFuture.get();
+            mActiveSurveyFuture.compareAndSet(surveyFuture, null);
+            return peaks;
+        }
+        catch(CancellationException e)
+        {
+            // Future was cancelled (e.g. by stopInternal) — treat as cancelled scan
+            mActiveSurveyFuture.compareAndSet(surveyFuture, null);
+
+            if(mCurrentEpoch.get() == myEpoch)
             {
                 setState(ScanState.CANCELLED);
+            }
+
+            return null;
+        }
+        catch(InterruptedException e)
+        {
+            mActiveSurveyFuture.compareAndSet(surveyFuture, null);
+
+            // Do NOT re-interrupt: we let the epoch check handle cancellation, and
+            // re-setting the flag would propagate into the pool's housekeeping.
+            if(mCurrentEpoch.get() == myEpoch)
+            {
+                setState(ScanState.CANCELLED);
+            }
+
+            return null;
+        }
+        catch(Exception e)
+        {
+            mActiveSurveyFuture.compareAndSet(surveyFuture, null);
+
+            if(mCurrentEpoch.get() != myEpoch)
+            {
+                // Stale — another scan is running
+                return null;
+            }
+
+            mLog.error("Spectral survey failed: {}", e.getMessage(), e);
+            setState(ScanState.ERROR);
+            return null;
+        }
+    }
+
+    /**
+     * Filters peaks (ignore-list + KNOWN channels), adds rows to the model, then probes the
+     * unknowns sequentially.  Returns {@code false} if the epoch became stale (caller should
+     * exit immediately); returns {@code true} if the loop completed normally.
+     *
+     * @param request         the active scan request
+     * @param myEpoch         the epoch of the current scan pass
+     * @param peaks           survey output
+     * @param addEnergyRows   if {@code true}, ENERGY_DETECTED rows are added to the model;
+     *                        {@code false} is reserved for future use
+     */
+    private void runProbeLoop(ScanRequest request, int myEpoch,
+                               List<EnergyPeak> peaks, boolean addEnergyRows)
+    {
+        setState(ScanState.PROBING);
+
+        List<Discovery> toProbeLater = new ArrayList<>();
+
+        for(EnergyPeak peak : peaks)
+        {
+            if(mCurrentEpoch.get() != myEpoch)
+            {
                 return;
             }
 
@@ -532,16 +843,15 @@ public class BandScanController
             }
         }
 
-        // --- Step 3: Sequential probing (one classification at a time) --------
+        // Sequential probing (one classification at a time)
         int probeLimit = (request.maxSignalsToProbe() > 0) ? request.maxSignalsToProbe() : Integer.MAX_VALUE;
         int probeCount = 0;
         int totalToProbe = Math.min(toProbeLater.size(), probeLimit);
 
         for(Discovery discovery : toProbeLater)
         {
-            if(mCancelled.get())
+            if(mCurrentEpoch.get() != myEpoch)
             {
-                setState(ScanState.CANCELLED);
                 return;
             }
 
@@ -550,7 +860,7 @@ public class BandScanController
                 break;
             }
 
-            probeOne(discovery);
+            probeOne(discovery, request, myEpoch);
             probeCount++;
 
             // Update probe progress: second half of the 0..1 range
@@ -560,25 +870,31 @@ public class BandScanController
                 setProgress(0.5 + probeProgress * 0.5);
             }
         }
+    }
 
-        if(mCancelled.get())
+    /**
+     * Schedules a continuous rescan via the scheduler.  The rescan body runs on
+     * {@code mExecutor} (submitted from the scheduled task) so the scheduler thread
+     * is never blocked by long-running work, and cancelling the submitted future
+     * actually stops the rescan.
+     */
+    private void scheduleRescan(ScanRequest request, int myEpoch)
+    {
+        try
         {
-            setState(ScanState.CANCELLED);
-            return;
-        }
-
-        setProgress(1.0);
-
-        // --- Step 4: Finished or schedule continuous re-scan ------------------
-        if(request.continuous())
-        {
-            setState(ScanState.IDLE_CONTINUOUS);
-
             ScheduledFuture<?> scheduled = mScheduler.schedule(
                 () -> {
-                    if(!mCancelled.get() && !mShutdown.get())
+                    if(mCurrentEpoch.get() == myEpoch && !mShutdown.get())
                     {
-                        runContinuousRescan(request);
+                        try
+                        {
+                            Future<?> rescanFuture = mExecutor.submit(() -> runRescan(request, myEpoch));
+                            mActiveScanFuture.compareAndSet(null, rescanFuture);
+                        }
+                        catch(RejectedExecutionException e)
+                        {
+                            mLog.warn("BandScanController: executor rejected rescan — executor may be shut down");
+                        }
                     }
                 },
                 request.continuousInterval().toMillis(),
@@ -586,23 +902,38 @@ public class BandScanController
 
             mContinuousSchedule.set(scheduled);
         }
-        else
+        catch(RejectedExecutionException e)
         {
-            setState(ScanState.DONE);
+            mLog.warn("BandScanController: scheduler rejected rescan scheduling — scheduler may be shut down");
         }
     }
 
     /**
      * Probes a single discovery synchronously (called on the executor thread).
+     *
+     * <p>If the classifier future is cancelled ({@code CancellationException}) the discovery
+     * is left in its current state (not set to ERROR) and the method returns without touching
+     * the model, allowing the epoch check in the caller to determine the final outcome.</p>
+     *
+     * @param discovery the discovery to probe
+     * @param request   the active scan request (used to get the candidate decoder set)
+     * @param myEpoch   the epoch of the current scan pass
      */
-    private void probeOne(Discovery discovery)
+    private void probeOne(Discovery discovery, ScanRequest request, int myEpoch)
     {
+        if(mCurrentEpoch.get() != myEpoch)
+        {
+            return;
+        }
+
         discovery.setState(DiscoveryState.PROBING);
         mDiscoveryModel.update(discovery);
 
+        // Pass the operator's chosen decoder set through to the classifier (#2)
         ClassificationRequest req = ClassificationRequest.forFrequency(
             discovery.getCenterFrequencyHz(),
             discovery.getBandwidthHz(),
+            request.candidateDecoders(),
             "scan@" + discovery.getCenterFrequencyHz());
 
         CompletableFuture<ClassificationResult> future = mClassifier.classify(req);
@@ -611,25 +942,39 @@ public class BandScanController
         try
         {
             ClassificationResult result = future.get();
-            applyClassificationResult(discovery, result);
+
+            if(mCurrentEpoch.get() == myEpoch)
+            {
+                applyClassificationResult(discovery, result);
+                mDiscoveryModel.update(discovery);
+            }
+        }
+        catch(CancellationException e)
+        {
+            // Future was cancelled (e.g. by stopInternal) — leave the discovery in its
+            // current state and let the epoch check in the caller decide the outcome.
+            mLog.debug("Classification cancelled for {} Hz", discovery.getCenterFrequencyHz());
         }
         catch(InterruptedException e)
         {
-            Thread.currentThread().interrupt();
-            mCancelled.set(true);
+            // Do NOT re-interrupt: returning the thread to the pool with an interrupt set
+            // causes unrelated pool housekeeping to be interrupted.
+            mLog.debug("Classification interrupted for {} Hz", discovery.getCenterFrequencyHz());
         }
         catch(ExecutionException e)
         {
-            mLog.warn("Classification error for {} Hz: {}", discovery.getCenterFrequencyHz(),
-                e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
-            discovery.setState(DiscoveryState.ERROR);
+            if(mCurrentEpoch.get() == myEpoch)
+            {
+                mLog.warn("Classification error for {} Hz: {}", discovery.getCenterFrequencyHz(),
+                    e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+                discovery.setState(DiscoveryState.ERROR);
+                mDiscoveryModel.update(discovery);
+            }
         }
         finally
         {
             mActiveClassifyFuture.compareAndSet(future, null);
         }
-
-        mDiscoveryModel.update(discovery);
     }
 
     /**
@@ -703,164 +1048,8 @@ public class BandScanController
     }
 
     // -------------------------------------------------------------------------
-    // Continuous re-scan
+    // Helpers
     // -------------------------------------------------------------------------
-
-    private void runContinuousRescan(ScanRequest request)
-    {
-        if(mCancelled.get() || mShutdown.get())
-        {
-            return;
-        }
-
-        mCancelled.set(false);
-        setState(ScanState.SURVEYING);
-        setProgress(0.0);
-
-        CompletableFuture<List<EnergyPeak>> surveyFuture = mSpectralSurvey.survey(
-            request.minFrequencyHz(),
-            request.maxFrequencyHz(),
-            request.surveyDwell(),
-            request.thresholdDb(),
-            fraction -> setProgress(fraction * 0.5));
-
-        List<EnergyPeak> peaks;
-
-        try
-        {
-            peaks = surveyFuture.get();
-        }
-        catch(InterruptedException e)
-        {
-            Thread.currentThread().interrupt();
-            setState(ScanState.CANCELLED);
-            return;
-        }
-        catch(Exception e)
-        {
-            if(mCancelled.get())
-            {
-                setState(ScanState.CANCELLED);
-                return;
-            }
-
-            mLog.error("Continuous re-survey failed: {}", e.getMessage(), e);
-            setState(ScanState.ERROR);
-            return;
-        }
-
-        if(mCancelled.get())
-        {
-            setState(ScanState.CANCELLED);
-            return;
-        }
-
-        setState(ScanState.PROBING);
-
-        List<Discovery> toProbeLater = new ArrayList<>();
-
-        for(EnergyPeak peak : peaks)
-        {
-            if(mCancelled.get())
-            {
-                setState(ScanState.CANCELLED);
-                return;
-            }
-
-            if(isIgnored(peak))
-            {
-                continue;
-            }
-
-            // Try to match an existing row by approximate frequency
-            Discovery existing = findExistingDiscovery(peak);
-
-            if(existing != null)
-            {
-                // Update the existing row's last-seen time and state
-                existing.setLastSeen(Instant.now());
-
-                if(existing.getState() == DiscoveryState.UNIDENTIFIED)
-                {
-                    if(existing.isWatched())
-                    {
-                        // Re-probe watched unidentified rows
-                        toProbeLater.add(existing);
-                    }
-                    else
-                    {
-                        // Update state to ENERGY_DETECTED to reflect fresh energy
-                        existing.setState(DiscoveryState.ENERGY_DETECTED);
-                        mDiscoveryModel.update(existing);
-                    }
-                }
-                else
-                {
-                    mDiscoveryModel.update(existing);
-                }
-            }
-            else
-            {
-                // Brand new peak
-                if(isKnownChannel(peak))
-                {
-                    Discovery discovery = new Discovery(peak, Instant.now());
-                    discovery.setState(DiscoveryState.KNOWN);
-                    mDiscoveryModel.add(discovery);
-                }
-                else
-                {
-                    Discovery discovery = new Discovery(peak, Instant.now());
-                    mDiscoveryModel.add(discovery);
-                    toProbeLater.add(discovery);
-                }
-            }
-        }
-
-        // Sequential probing for new/watched discoveries
-        int probeLimit = (request.maxSignalsToProbe() > 0) ? request.maxSignalsToProbe() : Integer.MAX_VALUE;
-        int probeCount = 0;
-
-        for(Discovery discovery : toProbeLater)
-        {
-            if(mCancelled.get())
-            {
-                setState(ScanState.CANCELLED);
-                return;
-            }
-
-            if(probeCount >= probeLimit)
-            {
-                break;
-            }
-
-            probeOne(discovery);
-            probeCount++;
-        }
-
-        if(mCancelled.get())
-        {
-            setState(ScanState.CANCELLED);
-            return;
-        }
-
-        setProgress(1.0);
-
-        // Schedule the next cycle
-        setState(ScanState.IDLE_CONTINUOUS);
-
-        ScheduledFuture<?> scheduled = mScheduler.schedule(
-            () -> {
-                if(!mCancelled.get() && !mShutdown.get())
-                {
-                    runContinuousRescan(request);
-                }
-            },
-            request.continuousInterval().toMillis(),
-            TimeUnit.MILLISECONDS);
-
-        mContinuousSchedule.set(scheduled);
-    }
 
     /**
      * Finds an existing discovery that overlaps the given energy peak.
@@ -874,10 +1063,6 @@ public class BandScanController
             peak.centerFrequencyHz(), peak.occupiedBandwidthHz());
         return overlapping.isEmpty() ? null : overlapping.get(0);
     }
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
 
     /**
      * Determines whether the given peak falls within any user-configured ignore range.
@@ -935,19 +1120,30 @@ public class BandScanController
     }
 
     /**
-     * Internal stop logic.
+     * Internal stop logic.  Bumps the epoch so in-flight scan bodies detect stale state and
+     * exit, cancels the active survey future (promptly releasing the tuner source), cancels
+     * the active classifier future, cancels any pending continuous-rescan schedule, and
+     * optionally sets the state to {@link ScanState#CANCELLED}.
      *
      * @param setStateCancelled whether to set state to CANCELLED after stopping
      */
     private void stopInternal(boolean setStateCancelled)
     {
-        mCancelled.set(true);
+        // Bump epoch — in-flight scan bodies check this at every loop iteration
+        mCurrentEpoch.incrementAndGet();
 
         // Cancel the continuous schedule
         ScheduledFuture<?> schedule = mContinuousSchedule.getAndSet(null);
         if(schedule != null)
         {
             schedule.cancel(false);
+        }
+
+        // Cancel the active survey — releases the tuner source promptly
+        CompletableFuture<List<EnergyPeak>> surveyFuture = mActiveSurveyFuture.getAndSet(null);
+        if(surveyFuture != null)
+        {
+            surveyFuture.cancel(true);
         }
 
         // Cancel any in-flight classification
@@ -957,7 +1153,7 @@ public class BandScanController
             classifyFuture.cancel(true);
         }
 
-        // Cancel the scan task
+        // Cancel the scan task (interrupt the blocked .get() if any)
         Future<?> scanFuture = mActiveScanFuture.getAndSet(null);
         if(scanFuture != null)
         {
@@ -984,8 +1180,9 @@ public class BandScanController
 
         Channel deleted = event.getChannel();
 
-        // Scan all discoveries for a matching createdChannel reference
-        for(Discovery d : mDiscoveryModel.getDiscoveries())
+        // Snapshot to avoid ConcurrentModificationException when DiscoveryModel marshals
+        // adds/removes on the FX thread while we iterate
+        for(Discovery d : new ArrayList<>(mDiscoveryModel.getDiscoveries()))
         {
             if(deleted.equals(d.getCreatedChannel()))
             {
@@ -994,21 +1191,5 @@ public class BandScanController
                 break;
             }
         }
-    }
-
-    /**
-     * Extracts the center frequency from a channel's source configuration.
-     *
-     * @param channel the channel
-     * @return frequency in Hz, or -1 if not determinable
-     */
-    private static long channelFrequency(Channel channel)
-    {
-        if(channel.getSourceConfiguration() instanceof SourceConfigTuner sc)
-        {
-            return sc.getFrequency();
-        }
-
-        return -1L;
     }
 }
