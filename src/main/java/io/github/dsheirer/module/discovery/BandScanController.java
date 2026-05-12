@@ -775,12 +775,32 @@ public class BandScanController
 
         // Obtain the future BEFORE publishing SURVEYING state so that any thread that
         // observes SURVEYING can rely on mActiveSurveyFuture already being set for cancellation.
-        CompletableFuture<List<EnergyPeak>> surveyFuture = mSpectralSurvey.survey(
-            request.minFrequencyHz(),
-            request.maxFrequencyHz(),
-            request.surveyDwell(),
-            request.thresholdDb(),
-            fraction -> setProgress(progressStart + fraction * progressRange));
+        // Dispatch to the stepped sweep if the request carries a TunerControl; otherwise use
+        // the standard in-band survey.
+        CompletableFuture<List<EnergyPeak>> surveyFuture;
+
+        if(request.requiresSteppedSweep())
+        {
+            mLog.info("Band scan: using stepped sweep for span {} – {} MHz",
+                request.minFrequencyHz() / 1_000_000.0,
+                request.maxFrequencyHz() / 1_000_000.0);
+            surveyFuture = mSpectralSurvey.surveyWide(
+                request.minFrequencyHz(),
+                request.maxFrequencyHz(),
+                request.surveyDwell(),
+                request.thresholdDb(),
+                request.tunerControl(),
+                fraction -> setProgress(progressStart + fraction * progressRange));
+        }
+        else
+        {
+            surveyFuture = mSpectralSurvey.survey(
+                request.minFrequencyHz(),
+                request.maxFrequencyHz(),
+                request.surveyDwell(),
+                request.thresholdDb(),
+                fraction -> setProgress(progressStart + fraction * progressRange));
+        }
 
         // Store before publishing state
         mActiveSurveyFuture.set(surveyFuture);

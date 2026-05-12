@@ -328,7 +328,8 @@ class BandScanControllerTest
             6.0,
             200,
             false,
-            Duration.ofSeconds(300));
+            Duration.ofSeconds(300),
+            null); // in-band mode
     }
 
     private static EnergyPeak makePeak(long centerHz)
@@ -574,7 +575,7 @@ class BandScanControllerTest
         // Only probe 1 signal
         ScanRequest req = new ScanRequest(MIN_HZ, MAX_HZ,
             EnumSet.of(DecoderType.NBFM),
-            Duration.ofMillis(1), 6.0, 1, false, Duration.ofSeconds(300));
+            Duration.ofMillis(1), 6.0, 1, false, Duration.ofSeconds(300), null);
 
         BandScanController ctrl = makeController(new FakeSurvey(peaks), classifier);
         ctrl.startScan(req);
@@ -736,7 +737,7 @@ class BandScanControllerTest
 
         ScanRequest req = new ScanRequest(MIN_HZ, MAX_HZ,
             requestedDecoders,
-            Duration.ofMillis(1), 6.0, 200, false, Duration.ofSeconds(300));
+            Duration.ofMillis(1), 6.0, 200, false, Duration.ofSeconds(300), null);
 
         FakeClassifier classifier = new FakeClassifier(Map.of());
         BandScanController ctrl = makeController(new FakeSurvey(List.of(makePeak(FREQ_A))), classifier);
@@ -1163,7 +1164,7 @@ class BandScanControllerTest
         ScanRequest continuous = new ScanRequest(MIN_HZ, MAX_HZ,
             EnumSet.of(DecoderType.NBFM),
             Duration.ofMillis(1), 6.0, 200,
-            true, Duration.ofMillis(50));  // short interval for fast test
+            true, Duration.ofMillis(50), null);  // short interval for fast test
 
         BandScanController ctrl = makeController(new FakeSurvey(List.of(makePeak(FREQ_A))), classifier);
         ctrl.startScan(continuous);
@@ -1199,7 +1200,7 @@ class BandScanControllerTest
         ScanRequest continuous = new ScanRequest(MIN_HZ, MAX_HZ,
             EnumSet.of(DecoderType.NBFM),
             Duration.ofMillis(1), 6.0, 200,
-            true, Duration.ofMillis(50));
+            true, Duration.ofMillis(50), null);
 
         BandScanController ctrl = makeController(new FakeSurvey(List.of(makePeak(FREQ_A))), countingClassifier);
         ctrl.startScan(continuous);
@@ -1255,7 +1256,7 @@ class BandScanControllerTest
         ScanRequest continuous = new ScanRequest(MIN_HZ, MAX_HZ,
             EnumSet.of(DecoderType.NBFM),
             Duration.ofMillis(1), 6.0, 200,
-            true, Duration.ofMillis(50));
+            true, Duration.ofMillis(50), null);
 
         BandScanController ctrl = makeController(switchingSurvey, countingClassifier);
         ctrl.startScan(continuous);
@@ -1280,5 +1281,124 @@ class BandScanControllerTest
         // Must have probed again even though the survey returned no energy at FREQ_A
         assertTrue(classifyCallCount.get() > callCountAfterFirstCycle,
             "Watched UNIDENTIFIED should be re-probed even when survey returns no peak at that frequency");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 5.2: stepped-sweep path in BandScanController
+    // -------------------------------------------------------------------------
+
+    /**
+     * A {@link SpectralSurveyApi} fake that records calls to both {@code survey} and
+     * {@code surveyWide}, and returns scripted peak lists for each.
+     */
+    private static class RecordingWideSurvey implements SpectralSurveyApi
+    {
+        private final List<EnergyPeak> mInBandPeaks;
+        private final List<EnergyPeak> mWidePeaks;
+        private final AtomicInteger mSurveyCallCount = new AtomicInteger(0);
+        private final AtomicInteger mSurveyWideCallCount = new AtomicInteger(0);
+        private final AtomicReference<TunerControl> mLastTunerControl = new AtomicReference<>(null);
+
+        RecordingWideSurvey(List<EnergyPeak> inBandPeaks, List<EnergyPeak> widePeaks)
+        {
+            mInBandPeaks = inBandPeaks;
+            mWidePeaks = widePeaks;
+        }
+
+        @Override
+        public CompletableFuture<List<EnergyPeak>> survey(long minHz, long maxHz, Duration dwell,
+                                                           double thresholdDb,
+                                                           SpectralSurvey.ProgressListener progress)
+        {
+            mSurveyCallCount.incrementAndGet();
+            if(progress != null) progress.onProgress(1.0);
+            return CompletableFuture.completedFuture(mInBandPeaks);
+        }
+
+        @Override
+        public CompletableFuture<List<EnergyPeak>> surveyWide(long minHz, long maxHz, Duration dwell,
+                                                               double thresholdDb,
+                                                               TunerControl tunerControl,
+                                                               SpectralSurvey.ProgressListener progress)
+        {
+            mSurveyWideCallCount.incrementAndGet();
+            mLastTunerControl.set(tunerControl);
+            if(progress != null) progress.onProgress(1.0);
+            return CompletableFuture.completedFuture(mWidePeaks);
+        }
+
+        int getSurveyCallCount()    { return mSurveyCallCount.get(); }
+        int getSurveyWideCallCount() { return mSurveyWideCallCount.get(); }
+        TunerControl getLastTunerControl() { return mLastTunerControl.get(); }
+    }
+
+    /**
+     * Minimal {@link TunerControl} stub for tests — no actual hardware.
+     */
+    private static class StubTunerControl implements TunerControl
+    {
+        @Override public long getCurrentCenterFreqHz()  { return MIN_HZ + (MAX_HZ - MIN_HZ) / 2; }
+        @Override public long getUsableBandwidthHz()    { return 2_000_000L; }
+        @Override public long getMinFrequencyHz()       { return MIN_HZ; }
+        @Override public long getMaxFrequencyHz()       { return MAX_HZ; }
+        @Override public void setCenterFreqHz(long hz)  { /* no-op for test */ }
+        @Override public boolean isAvailable()          { return true; }
+    }
+
+    @Test
+    void steppedSweepPathIsInvokedWhenTunerControlIsPresent() throws InterruptedException
+    {
+        TunerControl tuner = new StubTunerControl();
+        List<EnergyPeak> widePeaks = List.of(makePeak(FREQ_A), makePeak(FREQ_B));
+        RecordingWideSurvey survey = new RecordingWideSurvey(List.of(), widePeaks);
+
+        FakeClassifier classifier = new FakeClassifier(Map.of());
+
+        ScanRequest stepped = new ScanRequest(MIN_HZ, MAX_HZ,
+            EnumSet.of(DecoderType.NBFM),
+            Duration.ofMillis(1), 6.0, 200,
+            false, Duration.ofSeconds(300),
+            tuner); // non-null tunerControl triggers stepped sweep
+
+        BandScanController ctrl = makeController(survey, classifier);
+        ctrl.startScan(stepped);
+
+        awaitState(ctrl, ScanState.DONE, 5_000);
+
+        // surveyWide should have been called exactly once; survey (in-band) never
+        assertEquals(1, survey.getSurveyWideCallCount(), "surveyWide should be called for stepped scan");
+        assertEquals(0, survey.getSurveyCallCount(),     "in-band survey should NOT be called for stepped scan");
+
+        // The TunerControl passed to surveyWide should be the one from the request
+        assertNotNull(survey.getLastTunerControl(), "TunerControl should be forwarded to surveyWide");
+
+        // Both peaks from the stepped sweep should be discovered
+        assertEquals(2, mModel.getDiscoveries().size(),
+            "Both peaks returned by surveyWide should be probed and discovered");
+    }
+
+    @Test
+    void inBandPathIsUsedWhenNoTunerControl() throws InterruptedException
+    {
+        List<EnergyPeak> inBandPeaks = List.of(makePeak(FREQ_A));
+        RecordingWideSurvey survey = new RecordingWideSurvey(inBandPeaks, List.of());
+
+        FakeClassifier classifier = new FakeClassifier(Map.of());
+
+        // null tunerControl → in-band path
+        ScanRequest inBand = new ScanRequest(MIN_HZ, MAX_HZ,
+            EnumSet.of(DecoderType.NBFM),
+            Duration.ofMillis(1), 6.0, 200,
+            false, Duration.ofSeconds(300),
+            null);
+
+        BandScanController ctrl = makeController(survey, classifier);
+        ctrl.startScan(inBand);
+
+        awaitState(ctrl, ScanState.DONE, 5_000);
+
+        assertEquals(1, survey.getSurveyCallCount(),      "in-band survey should be called when no TunerControl");
+        assertEquals(0, survey.getSurveyWideCallCount(),  "surveyWide should NOT be called when no TunerControl");
+        assertEquals(1, mModel.getDiscoveries().size(), "Peak from in-band survey should be discovered");
     }
 }

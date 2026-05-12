@@ -30,6 +30,13 @@ import java.util.Set;
  * <p>Use {@link #defaults(long, long, DiscoveryPreference)} to build a request seeded
  * from the user's current preferences, or construct the record directly for full control.</p>
  *
+ * <h3>In-band vs stepped sweep</h3>
+ * <p>When {@code tunerControl} is {@code null}, the scan uses the non-disruptive in-band
+ * survey.  When {@code tunerControl} is non-null, the scan uses the stepped sweep (
+ * {@link SpectralSurveyApi#surveyWide}), which retunes the hardware across the span.
+ * The {@link io.github.dsheirer.gui.playlist.discovery.ScanDialog} sets this field only
+ * after the operator has confirmed the disruption warning.</p>
+ *
  * @param minFrequencyHz        lower bound of the scan span in Hz
  * @param maxFrequencyHz        upper bound of the scan span in Hz
  * @param candidateDecoders     decoders to try during classification probing
@@ -38,6 +45,8 @@ import java.util.Set;
  * @param maxSignalsToProbe     maximum number of energy peaks to classify (0 = unlimited)
  * @param continuous            whether to re-survey after {@code continuousInterval} and repeat
  * @param continuousInterval    delay between survey cycles when {@code continuous == true}
+ * @param tunerControl          if non-null, the stepped sweep is used with this tuner control seam;
+ *                              if null, the in-band (non-disruptive) survey is used
  */
 public record ScanRequest(
     long minFrequencyHz,
@@ -47,7 +56,8 @@ public record ScanRequest(
     double thresholdDb,
     int maxSignalsToProbe,
     boolean continuous,
-    Duration continuousInterval)
+    Duration continuousInterval,
+    TunerControl tunerControl)
 {
     /** Default maximum number of peaks to probe in a single scan cycle. */
     public static final int DEFAULT_MAX_SIGNALS_TO_PROBE = 200;
@@ -90,6 +100,17 @@ public record ScanRequest(
         {
             continuousInterval = DEFAULT_CONTINUOUS_INTERVAL;
         }
+
+        // tunerControl may be null (in-band mode) — no validation required
+    }
+
+    /**
+     * Returns {@code true} if this request requires a stepped sweep (i.e. a non-null
+     * {@link TunerControl} was supplied).
+     */
+    public boolean requiresSteppedSweep()
+    {
+        return tunerControl != null;
     }
 
     // -------------------------------------------------------------------------
@@ -124,7 +145,8 @@ public record ScanRequest(
             prefs.getEnergyThresholdDb(),
             DEFAULT_MAX_SIGNALS_TO_PROBE,
             false,
-            DEFAULT_CONTINUOUS_INTERVAL
+            DEFAULT_CONTINUOUS_INTERVAL,
+            null   // in-band mode; caller sets a non-null TunerControl for stepped sweep
         );
     }
 }

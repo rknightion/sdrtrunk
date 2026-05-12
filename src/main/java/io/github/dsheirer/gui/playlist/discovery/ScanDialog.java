@@ -359,7 +359,8 @@ public class ScanDialog extends Stage
             thresholdDb,
             maxSignals,
             continuous,
-            Duration.ofMinutes(intervalMinutes));
+            Duration.ofMinutes(intervalMinutes),
+            null); // null = in-band mode; a future improvement can pass a TunerControl for stepped sweep
 
         mLog.info("Starting band scan: {} – {} MHz, {} decoders, dwell {}s, threshold {}dB",
             String.format(Locale.ROOT, "%.3f", minMhz),
