@@ -27,6 +27,7 @@ public enum PreferenceEditorType
     APPLICATION("Application"),
     CHANNEL_EVENT("Channel Events"),
     DIRECTORY("Directories"),
+    DISCOVERY("Signal Discovery"),
     JMBE_LIBRARY("JMBE Audio Library"),
     AUDIO_MP3("MP3"),
     AUDIO_RECORD("Record"),

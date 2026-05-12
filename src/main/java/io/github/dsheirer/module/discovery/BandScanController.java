@@ -200,6 +200,19 @@ public class BandScanController
     // -------------------------------------------------------------------------
 
     /**
+     * Returns the {@link DiscoveryModel} that this controller populates during a scan.
+     *
+     * <p>Phase 4 uses this to bind the {@link javafx.scene.control.TableView} in
+     * {@link io.github.dsheirer.gui.playlist.discovery.DiscoveryEditor}.</p>
+     *
+     * @return the discovery model; never null
+     */
+    public DiscoveryModel getDiscoveryModel()
+    {
+        return mDiscoveryModel;
+    }
+
+    /**
      * Observable property tracking the current scan state.
      *
      * @return state property (never null)
