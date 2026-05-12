@@ -35,9 +35,12 @@ import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.prefs.Preferences;
@@ -61,6 +64,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Tests that require scan completion use {@link #awaitState(BandScanController, ScanState, long)}
  * to spin-wait rather than fixed sleeps.</p>
+ *
+ * <p>Preferences are backed by a uniquely-named throwaway node per test so that the
+ * developer's real OS-level preference store is never touched.</p>
  */
 @Timeout(30)
 class BandScanControllerTest
@@ -71,6 +77,7 @@ class BandScanControllerTest
     private static final long FREQ_B = 155_000_000L;
 
     private ExecutorService mExecutor;
+    private Preferences mTestPrefsNode;
     private UserPreferences mUserPreferences;
     private DiscoveryModel mModel;
     private ChannelModel mChannelModel;
@@ -84,10 +91,16 @@ class BandScanControllerTest
     private static class FakeSurvey implements SpectralSurveyApi
     {
         private final List<EnergyPeak> mPeaks;
+        private final AtomicBoolean mStopped = new AtomicBoolean(false);
 
         FakeSurvey(List<EnergyPeak> peaks)
         {
             mPeaks = peaks;
+        }
+
+        boolean wasStopped()
+        {
+            return mStopped.get();
         }
 
         @Override
@@ -103,6 +116,39 @@ class BandScanControllerTest
         }
     }
 
+    /**
+     * A survey that blocks indefinitely until its future is cancelled.
+     * Tracks whether the underlying "source" (stop/dispose) was released on cancel.
+     */
+    private static class BlockingSurvey implements SpectralSurveyApi
+    {
+        private final AtomicBoolean mSourceReleased = new AtomicBoolean(false);
+
+        boolean wasSourceReleased()
+        {
+            return mSourceReleased.get();
+        }
+
+        @Override
+        public CompletableFuture<List<EnergyPeak>> survey(long minHz, long maxHz, Duration dwell,
+                                                           double thresholdDb,
+                                                           SpectralSurvey.ProgressListener progress)
+        {
+            // Return a CompletableFuture whose cancel() releases the simulated source
+            CompletableFuture<List<EnergyPeak>> future = new CompletableFuture<List<EnergyPeak>>()
+            {
+                @Override
+                public boolean cancel(boolean mayInterruptIfRunning)
+                {
+                    // Simulate releasing the tuner source on cancellation
+                    mSourceReleased.set(true);
+                    return super.cancel(mayInterruptIfRunning);
+                }
+            };
+            return future;
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Fake classifier — returns scripted results keyed by frequency
     // -------------------------------------------------------------------------
@@ -113,6 +159,9 @@ class BandScanControllerTest
         private final AtomicInteger mCallCount = new AtomicInteger(0);
         private final AtomicInteger mMaxConcurrent = new AtomicInteger(0);
         private final AtomicInteger mCurrentConcurrent = new AtomicInteger(0);
+        /** Captures the ClassificationRequest passed to classify() on each call. */
+        private final List<ClassificationRequest> mReceivedRequests =
+            Collections.synchronizedList(new ArrayList<>());
 
         FakeClassifier(Map<Long, ClassificationResult> results)
         {
@@ -126,6 +175,7 @@ class BandScanControllerTest
             mMaxConcurrent.accumulateAndGet(concurrent, Math::max);
 
             mCallCount.incrementAndGet();
+            mReceivedRequests.add(request);
 
             ClassificationResult result = mResults.getOrDefault(
                 request.centerFrequencyHz(),
@@ -143,6 +193,26 @@ class BandScanControllerTest
         int getMaxConcurrent()
         {
             return mMaxConcurrent.get();
+        }
+
+        List<ClassificationRequest> getReceivedRequests()
+        {
+            return Collections.unmodifiableList(mReceivedRequests);
+        }
+    }
+
+    /**
+     * A classifier that blocks until its future is explicitly cancelled.
+     * Useful for testing stop() behaviour mid-classification.
+     */
+    private static class BlockingClassifier implements Classifier
+    {
+        @Override
+        public CompletableFuture<ClassificationResult> classify(ClassificationRequest request)
+        {
+            // Return a future that never completes normally — only via cancel()
+            CompletableFuture<ClassificationResult> future = new CompletableFuture<>();
+            return future;
         }
     }
 
@@ -187,10 +257,8 @@ class BandScanControllerTest
     @BeforeEach
     void setUp() throws Exception
     {
-        // Clear any DiscoveryPreference state persisted from prior test runs (the ignore list
-        // in particular is written to the real OS-level java.util.prefs store and bleeds
-        // between test methods/runs if not explicitly reset).
-        Preferences.userNodeForPackage(DiscoveryPreference.class).clear();
+        // Each test gets its own isolated Preferences node — never touches real user prefs
+        mTestPrefsNode = Preferences.userRoot().node("sdrtrunk-test-" + UUID.randomUUID());
 
         mExecutor = Executors.newCachedThreadPool(r ->
         {
@@ -199,7 +267,8 @@ class BandScanControllerTest
             return t;
         });
 
-        mUserPreferences = new UserPreferences();
+        // Build a UserPreferences-like object but with the discovery prefs backed by our test node
+        mUserPreferences = new UserPreferencesWithTestDiscoveryPrefs(mTestPrefsNode);
         mModel = new DiscoveryModel();
         mChannelModel = new ChannelModel(new AliasModel());
         mChannelProcessingManager = new RecordingChannelProcessingManager();
@@ -210,8 +279,28 @@ class BandScanControllerTest
     void tearDown() throws Exception
     {
         mExecutor.shutdownNow();
-        // Clean up preferences written during this test so subsequent runs start clean.
-        Preferences.userNodeForPackage(DiscoveryPreference.class).clear();
+        // Remove the throwaway Preferences node
+        try { mTestPrefsNode.removeNode(); } catch(Exception ignored) {}
+    }
+
+    /**
+     * A {@link UserPreferences} subclass that overrides {@link #getDiscoveryPreference()} to
+     * return a {@link DiscoveryPreference} backed by the test's isolated Preferences node.
+     */
+    private static class UserPreferencesWithTestDiscoveryPrefs extends UserPreferences
+    {
+        private final DiscoveryPreference mDiscoveryPreference;
+
+        UserPreferencesWithTestDiscoveryPrefs(Preferences testNode)
+        {
+            mDiscoveryPreference = new DiscoveryPreference(t -> {}, testNode);
+        }
+
+        @Override
+        public DiscoveryPreference getDiscoveryPreference()
+        {
+            return mDiscoveryPreference;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -324,51 +413,73 @@ class BandScanControllerTest
     }
 
     // -------------------------------------------------------------------------
-    // ENERGY_DETECTED rows added before probing
+    // ENERGY_DETECTED rows added before probing — #9 strengthened test
     // -------------------------------------------------------------------------
 
+    /**
+     * Verifies that all peaks are seeded into the model as rows before any probing begins.
+     *
+     * <p>The core invariant is: at the moment the first classify() call is made, the model
+     * already contains rows for ALL peaks (both FREQ_A and FREQ_B).  The first row will be
+     * in PROBING state (set by probeOne just before classify()), and the second row should
+     * still be in ENERGY_DETECTED state (not yet reached by the sequential prober).</p>
+     *
+     * <p>Because {@link Discovery} is mutable, we snapshot both the frequency set AND the
+     * per-row state at the moment of the first classify() call, before the future is returned
+     * (and before inline-synchronous FakeClassifier execution unwinds).</p>
+     */
     @Test
     void energyDetectedRowsAddedBeforeProbing() throws InterruptedException
     {
-        // Classifier blocks momentarily so we can see the ENERGY_DETECTED rows
-        List<Long> energyDetectedFreqs = new ArrayList<>();
+        List<EnergyPeak> peaks = List.of(makePeak(FREQ_A), makePeak(FREQ_B));
 
-        Classifier blockingClassifier = req ->
+        // A latch that releases once the first classify() call is made
+        CountDownLatch firstClassifyLatch = new CountDownLatch(1);
+        // Snapshot of (freq → state) taken at the moment of the first classify() call
+        AtomicReference<Map<Long, DiscoveryState>> statesAtFirstClassify = new AtomicReference<>();
+
+        Classifier capturingClassifier = req ->
         {
-            // Capture the state of the model at the start of each classify call
-            for(Discovery d : mModel.getDiscoveries())
+            // On the very first call, snapshot freq→state for all model rows
+            if(firstClassifyLatch.getCount() > 0)
             {
-                if(d.getState() == DiscoveryState.ENERGY_DETECTED || d.getState() == DiscoveryState.PROBING)
+                Map<Long, DiscoveryState> states = new java.util.HashMap<>();
+                for(Discovery d : mModel.getDiscoveries())
                 {
-                    // We can see the row exists before the classify completes
+                    // Capture the STATE value (enum), not the mutable Discovery object
+                    states.put(d.getCenterFrequencyHz(), d.getState());
                 }
+                statesAtFirstClassify.set(states);
+                firstClassifyLatch.countDown();
             }
             return CompletableFuture.completedFuture(
                 ClassificationResult.unidentified(req.centerFrequencyHz(), List.of(), Double.NaN));
         };
 
-        List<EnergyPeak> peaks = List.of(makePeak(FREQ_A), makePeak(FREQ_B));
-        BandScanController ctrl = makeController(new FakeSurvey(peaks), blockingClassifier);
-
-        // Subscribe to ADDED events before starting the scan
-        List<DiscoveryEvent> addedEvents = new ArrayList<>();
-        mModel.addListener(e -> {
-            if(e.type() == DiscoveryEvent.Type.ADDED)
-            {
-                addedEvents.add(e);
-            }
-        });
-
+        BandScanController ctrl = makeController(new FakeSurvey(peaks), capturingClassifier);
         ctrl.startScan(simpleScan());
-        awaitState(ctrl, ScanState.DONE, 5_000);
 
-        // Both peaks should have generated ADDED events
-        assertEquals(2, addedEvents.size(), "Expected 2 ADDED events, one per peak");
-        List<Long> addedFreqs = addedEvents.stream()
-            .map(e -> e.discovery().getCenterFrequencyHz())
-            .toList();
-        assertTrue(addedFreqs.contains(FREQ_A));
-        assertTrue(addedFreqs.contains(FREQ_B));
+        // Wait for the first classify() call
+        assertTrue(firstClassifyLatch.await(5, java.util.concurrent.TimeUnit.SECONDS),
+            "First classify() should have been called within 5 seconds");
+
+        // At the time of the first classify(), BOTH rows must already be in the model
+        Map<Long, DiscoveryState> states = statesAtFirstClassify.get();
+        assertNotNull(states, "State snapshot at first classify() must not be null");
+        assertEquals(2, states.size(),
+            "Both rows must be in the model before probing starts; got " + states.size());
+
+        assertTrue(states.containsKey(FREQ_A), "FREQ_A row must be present before probing");
+        assertTrue(states.containsKey(FREQ_B), "FREQ_B row must be present before probing");
+
+        // FREQ_A is being probed right now — it will be PROBING
+        // FREQ_B has been seeded but not yet probed — it will be ENERGY_DETECTED
+        assertEquals(DiscoveryState.PROBING, states.get(FREQ_A),
+            "FREQ_A should be PROBING (first to be classified)");
+        assertEquals(DiscoveryState.ENERGY_DETECTED, states.get(FREQ_B),
+            "FREQ_B should be ENERGY_DETECTED (seeded but not yet probed)");
+
+        awaitState(ctrl, ScanState.DONE, 5_000);
     }
 
     // -------------------------------------------------------------------------
@@ -614,6 +725,35 @@ class BandScanControllerTest
     }
 
     // -------------------------------------------------------------------------
+    // Fix #2: candidateDecoders from ScanRequest passed through to classifier
+    // -------------------------------------------------------------------------
+
+    @Test
+    void candidateDecodersFromScanRequestPassedToClassifier() throws InterruptedException
+    {
+        // Request with a specific (non-default) decoder set
+        EnumSet<DecoderType> requestedDecoders = EnumSet.of(DecoderType.NBFM, DecoderType.DMR);
+
+        ScanRequest req = new ScanRequest(MIN_HZ, MAX_HZ,
+            requestedDecoders,
+            Duration.ofMillis(1), 6.0, 200, false, Duration.ofSeconds(300));
+
+        FakeClassifier classifier = new FakeClassifier(Map.of());
+        BandScanController ctrl = makeController(new FakeSurvey(List.of(makePeak(FREQ_A))), classifier);
+
+        ctrl.startScan(req);
+        awaitState(ctrl, ScanState.DONE, 5_000);
+
+        // The classifier should have been called exactly once
+        assertEquals(1, classifier.getCallCount());
+
+        // The ClassificationRequest passed to the classifier must carry the same decoder set
+        ClassificationRequest received = classifier.getReceivedRequests().get(0);
+        assertEquals(requestedDecoders, received.candidateDecoders(),
+            "ClassificationRequest.candidateDecoders() must equal ScanRequest.candidateDecoders()");
+    }
+
+    // -------------------------------------------------------------------------
     // addAsChannel
     // -------------------------------------------------------------------------
 
@@ -836,7 +976,140 @@ class BandScanControllerTest
     }
 
     // -------------------------------------------------------------------------
-    // stop()
+    // Fix #1: stop() mid-PROBING must yield CANCELLED, not ERROR
+    // -------------------------------------------------------------------------
+
+    /**
+     * Starts a scan, lets the survey produce peaks, then calls stop() while a classification
+     * is in flight (using a BlockingClassifier whose future never completes normally).
+     * The final state must be CANCELLED or IDLE (not ERROR).
+     */
+    @Test
+    void stopMidProbingYieldsCancelledNotError() throws InterruptedException
+    {
+        // The blocking classifier's future is a never-completing CompletableFuture
+        // that will be cancelled by stopInternal()
+        BlockingClassifier blockingClassifier = new BlockingClassifier();
+
+        List<EnergyPeak> peaks = List.of(makePeak(FREQ_A));
+        BandScanController ctrl = makeController(new FakeSurvey(peaks), blockingClassifier);
+
+        ctrl.startScan(simpleScan());
+
+        // Wait for PROBING state (the survey completes instantly, probing blocks)
+        awaitState(ctrl, ScanState.PROBING, 3_000);
+
+        // Now stop mid-classify
+        ctrl.stop();
+
+        // State must be CANCELLED, not ERROR
+        assertEquals(ScanState.CANCELLED, ctrl.getScanState(),
+            "stop() mid-PROBING should yield CANCELLED, not ERROR");
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix #3: stop() must promptly release the survey's tuner source
+    // -------------------------------------------------------------------------
+
+    /**
+     * Verifies that calling stop() while the survey is blocking promptly cancels the
+     * survey future (simulating release of the tuner source), rather than waiting for
+     * the full dwell to expire.
+     */
+    @Test
+    void stopCancelsSurveyFuturePromptly() throws InterruptedException
+    {
+        BlockingSurvey blockingSurvey = new BlockingSurvey();
+
+        BandScanController ctrl = makeController(blockingSurvey, new FakeClassifier(Map.of()));
+        ctrl.startScan(simpleScan());
+
+        // Wait for SURVEYING state — by design mActiveSurveyFuture is set BEFORE
+        // setState(SURVEYING) so there is no race: the future is always available.
+        awaitState(ctrl, ScanState.SURVEYING, 2_000);
+
+        long before = System.currentTimeMillis();
+        ctrl.stop();
+        long elapsed = System.currentTimeMillis() - before;
+
+        // stop() should return quickly (not wait for the full 3-second dwell)
+        assertTrue(elapsed < 1_000,
+            "stop() should return quickly when survey is blocked, but took " + elapsed + " ms");
+
+        assertEquals(ScanState.CANCELLED, ctrl.getScanState());
+
+        // The survey future's cancel() should have been called (simulating source release)
+        assertTrue(blockingSurvey.wasSourceReleased(),
+            "Survey future cancel() must be called on stop() so the tuner source is released promptly");
+    }
+
+    // -------------------------------------------------------------------------
+    // Fix #4: double startScan is coherent (epoch prevents old scan clobbering new)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Calls startScan() twice in quick succession with a slow first scan (blocking survey).
+     * Asserts that:
+     * 1. The final state is DONE (from the second scan).
+     * 2. Only one scan's worth of rows appears in the model (no double-add from the stale first scan).
+     * 3. No exceptions are thrown.
+     */
+    @Test
+    void doubleStartScanIsCoherent() throws InterruptedException
+    {
+        // First survey blocks until cancelled
+        BlockingSurvey slowSurvey = new BlockingSurvey();
+
+        // Second survey returns one peak immediately
+        FakeSurvey fastSurvey = new FakeSurvey(List.of(makePeak(FREQ_A)));
+
+        // We need the controller to switch surveys. We use an AtomicReference to simulate
+        // switching: the first call returns the blocking survey, the second returns the fast one.
+        AtomicInteger callCount = new AtomicInteger(0);
+
+        SpectralSurveyApi switchingSurvey = (minHz, maxHz, dwell, threshold, progress) ->
+        {
+            int call = callCount.incrementAndGet();
+
+            if(call == 1)
+            {
+                return slowSurvey.survey(minHz, maxHz, dwell, threshold, progress);
+            }
+            else
+            {
+                return fastSurvey.survey(minHz, maxHz, dwell, threshold, progress);
+            }
+        };
+
+        FakeClassifier classifier = new FakeClassifier(Map.of());
+        BandScanController ctrl = makeController(switchingSurvey, classifier);
+
+        // Start first scan (will block in survey).
+        // Wait for SURVEYING so we know the blocking survey is active and its future
+        // is stored in mActiveSurveyFuture before we start the second scan.
+        ctrl.startScan(simpleScan());
+        awaitState(ctrl, ScanState.SURVEYING, 2_000);
+
+        // Now start the second scan — cancels the first and submits a new scan body
+        // that will call the fast survey (callCount == 2 → fastSurvey path)
+        ctrl.startScan(simpleScan());
+
+        // Wait for the second scan to complete
+        awaitState(ctrl, ScanState.DONE, 5_000);
+
+        assertEquals(ScanState.DONE, ctrl.getScanState(), "Second scan should end with DONE");
+
+        // Only the discoveries from the second scan should appear (epoch guard prevents
+        // the stale first scan from adding rows)
+        long freqACount = mModel.getDiscoveries().stream()
+            .filter(d -> d.getCenterFrequencyHz() == FREQ_A)
+            .count();
+        assertEquals(1, freqACount,
+            "Only one row for FREQ_A (from second scan); stale first scan should not add rows");
+    }
+
+    // -------------------------------------------------------------------------
+    // stop() sets CANCELLED state
     // -------------------------------------------------------------------------
 
     @Test
@@ -951,5 +1224,61 @@ class BandScanControllerTest
         // Watched unidentified should have been re-probed
         assertTrue(classifyCallCount.get() > callCountAfterFirstCycle,
             "Watched unidentified discovery should be re-probed in continuous cycle");
+    }
+
+    /**
+     * Verifies that a watched+UNIDENTIFIED discovery is re-probed in continuous mode even
+     * when the survey returns no energy at its frequency in the rescan cycle.
+     */
+    @Test
+    void continuousScanReprobesWatchedUnidentifiedEvenWithNoEnergy() throws InterruptedException
+    {
+        AtomicInteger classifyCallCount = new AtomicInteger(0);
+
+        Classifier countingClassifier = req ->
+        {
+            classifyCallCount.incrementAndGet();
+            return CompletableFuture.completedFuture(
+                ClassificationResult.unidentified(req.centerFrequencyHz(), List.of(), Double.NaN));
+        };
+
+        // First cycle: survey returns FREQ_A; subsequent cycles: survey returns nothing
+        AtomicInteger surveyCallCount = new AtomicInteger(0);
+        SpectralSurveyApi switchingSurvey = (minHz, maxHz, dwell, threshold, progress) ->
+        {
+            int call = surveyCallCount.incrementAndGet();
+            List<EnergyPeak> peaks = (call == 1) ? List.of(makePeak(FREQ_A)) : List.of();
+            if(progress != null) progress.onProgress(1.0);
+            return CompletableFuture.completedFuture(peaks);
+        };
+
+        ScanRequest continuous = new ScanRequest(MIN_HZ, MAX_HZ,
+            EnumSet.of(DecoderType.NBFM),
+            Duration.ofMillis(1), 6.0, 200,
+            true, Duration.ofMillis(50));
+
+        BandScanController ctrl = makeController(switchingSurvey, countingClassifier);
+        ctrl.startScan(continuous);
+
+        // Wait for first cycle to finish probing (FREQ_A is added and probed)
+        awaitState(ctrl, ScanState.IDLE_CONTINUOUS, 5_000);
+
+        // Mark the discovery as watched
+        Discovery d = mModel.getDiscoveries().stream()
+            .filter(x -> x.getCenterFrequencyHz() == FREQ_A)
+            .findFirst().orElseThrow();
+        ctrl.setWatched(d, true);
+
+        int callCountAfterFirstCycle = classifyCallCount.get();
+
+        // Wait for at least one more cycle (survey returns nothing, but watched+UNIDENTIFIED should be re-probed)
+        awaitState(ctrl, ScanState.SURVEYING, 5_000);
+        awaitState(ctrl, ScanState.IDLE_CONTINUOUS, 5_000);
+
+        ctrl.stop();
+
+        // Must have probed again even though the survey returned no energy at FREQ_A
+        assertTrue(classifyCallCount.get() > callCountAfterFirstCycle,
+            "Watched UNIDENTIFIED should be re-probed even when survey returns no peak at that frequency");
     }
 }

@@ -25,7 +25,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.UUID;
 import java.util.prefs.Preferences;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,31 +36,43 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Unit tests for DiscoveryPreference defaults and persistence.
  *
- * <p>Each test gets a fresh preference instance backed by the JVM user-preference store
- * (same store other Preference subclasses use).  The @AfterEach method purges only the
- * keys written by this class so that tests remain isolated and do not pollute a developer's
- * real settings.</p>
+ * <p>Each test gets a fresh {@link DiscoveryPreference} backed by a uniquely-named throwaway
+ * node under {@code java.util.prefs.Preferences.userRoot()}.  The node is removed in
+ * {@code @AfterEach} so developer preferences are never touched.</p>
  */
 class DiscoveryPreferenceTest
 {
+    private Preferences mTestNode;
     private DiscoveryPreference mPreference;
     private List<PreferenceType> mUpdateEvents;
 
     @BeforeEach
     void setUp() throws Exception
     {
-        // Clear any stale test values before each test
-        Preferences.userNodeForPackage(DiscoveryPreference.class).clear();
-
+        // Each test gets its own isolated Preferences node — never touches real user prefs
+        mTestNode = Preferences.userRoot().node("sdrtrunk-test-" + UUID.randomUUID());
         mUpdateEvents = new ArrayList<>();
-        mPreference = new DiscoveryPreference(mUpdateEvents::add);
+        mPreference = new DiscoveryPreference(mUpdateEvents::add, mTestNode);
     }
 
     @AfterEach
     void tearDown() throws Exception
     {
-        // Clean up so we don't pollute real user prefs
-        Preferences.userNodeForPackage(DiscoveryPreference.class).clear();
+        // Remove the throwaway node so nothing leaks between test runs
+        mTestNode.removeNode();
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Creates a second {@link DiscoveryPreference} backed by the same test node, simulating
+     * a fresh instance reading persisted values.
+     */
+    private DiscoveryPreference freshPreference()
+    {
+        return new DiscoveryPreference(t -> {}, mTestNode);
     }
 
     // -------------------------------------------------------------------------
@@ -147,66 +159,52 @@ class DiscoveryPreferenceTest
     // -------------------------------------------------------------------------
 
     @Test
-    void set_surveyDwellPersists() throws Exception
+    void set_surveyDwellPersists()
     {
         mPreference.setSurveyDwell(Duration.ofSeconds(10));
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(Duration.ofSeconds(10), fresh.getSurveyDwell());
+        assertEquals(Duration.ofSeconds(10), freshPreference().getSurveyDwell());
     }
 
     @Test
-    void set_energyThresholdPersists() throws Exception
+    void set_energyThresholdPersists()
     {
         mPreference.setEnergyThresholdDb(12.5);
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(12.5, fresh.getEnergyThresholdDb(), 0.001);
+        assertEquals(12.5, freshPreference().getEnergyThresholdDb(), 0.001);
     }
 
     @Test
-    void set_maxConcurrentProbesPersists() throws Exception
+    void set_maxConcurrentProbesPersists()
     {
         mPreference.setMaxConcurrentProbes(4);
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(4, fresh.getMaxConcurrentProbes());
+        assertEquals(4, freshPreference().getMaxConcurrentProbes());
     }
 
     @Test
-    void set_maxConcurrentClassificationsPersists() throws Exception
+    void set_maxConcurrentClassificationsPersists()
     {
         mPreference.setMaxConcurrentClassifications(3);
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(3, fresh.getMaxConcurrentClassifications());
+        assertEquals(3, freshPreference().getMaxConcurrentClassifications());
     }
 
     @Test
-    void set_clickDefaultBandwidthPersists() throws Exception
+    void set_clickDefaultBandwidthPersists()
     {
         mPreference.setClickDefaultBandwidthHz(25000);
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(25000, fresh.getClickDefaultBandwidthHz());
+        assertEquals(25000, freshPreference().getClickDefaultBandwidthHz());
     }
 
     @Test
-    void set_keepListeningDurationPersists() throws Exception
+    void set_keepListeningDurationPersists()
     {
         mPreference.setKeepListeningDuration(Duration.ofSeconds(60));
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(Duration.ofSeconds(60), fresh.getKeepListeningDuration());
+        assertEquals(Duration.ofSeconds(60), freshPreference().getKeepListeningDuration());
     }
 
     @Test
-    void set_overlayDisplayPersists() throws Exception
+    void set_overlayDisplayPersists()
     {
         mPreference.setOverlayDisplay(OverlayDisplay.ALL);
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(OverlayDisplay.ALL, fresh.getOverlayDisplay());
+        assertEquals(OverlayDisplay.ALL, freshPreference().getOverlayDisplay());
     }
 
     // -------------------------------------------------------------------------
@@ -241,13 +239,12 @@ class DiscoveryPreferenceTest
     }
 
     @Test
-    void ignoreList_persistsAcrossInstances() throws Exception
+    void ignoreList_persistsAcrossInstances()
     {
         IgnoreRange r = IgnoreRange.of(160_000_000L, 161_000_000L, "persist me");
         mPreference.addIgnoreRange(r);
 
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        List<IgnoreRange> loaded = fresh.getIgnoreList();
+        List<IgnoreRange> loaded = freshPreference().getIgnoreList();
         assertEquals(1, loaded.size());
         assertEquals(160_000_000L, loaded.get(0).minHz());
         assertEquals(161_000_000L, loaded.get(0).maxHz());
@@ -255,15 +252,14 @@ class DiscoveryPreferenceTest
     }
 
     @Test
-    void ignoreList_noteWithSpecialChars_roundTrips() throws Exception
+    void ignoreList_noteWithSpecialChars_roundTrips()
     {
         // Notes containing pipe, newline, and quotes must survive JSON serialisation
         String tricky = "has|pipe\nand\nnewlines \"and quotes\"";
         IgnoreRange r = IgnoreRange.of(170_000_000L, 171_000_000L, tricky);
         mPreference.addIgnoreRange(r);
 
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        List<IgnoreRange> loaded = fresh.getIgnoreList();
+        List<IgnoreRange> loaded = freshPreference().getIgnoreList();
         assertEquals(1, loaded.size());
         assertEquals(tricky, loaded.get(0).note(),
             "Note with special characters must survive JSON round-trip");
@@ -276,12 +272,10 @@ class DiscoveryPreferenceTest
     // -------------------------------------------------------------------------
 
     @Test
-    void set_tunerHeadroomChannelsPersists() throws Exception
+    void set_tunerHeadroomChannelsPersists()
     {
         mPreference.setTunerHeadroomChannels(2);
-
-        DiscoveryPreference fresh = new DiscoveryPreference(t -> {});
-        assertEquals(2, fresh.getTunerHeadroomChannels());
+        assertEquals(2, freshPreference().getTunerHeadroomChannels());
     }
 
     // -------------------------------------------------------------------------

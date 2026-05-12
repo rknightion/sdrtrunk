@@ -30,6 +30,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -254,40 +255,49 @@ class SpectralSurveyTest
     @Timeout(10) // should complete well within 5 seconds
     void survey_withFakeSource_detectsPeaksInCannedBuffers() throws Exception
     {
-        // Create a fake source that emits a tone at a known frequency bin
+        // Create a fake source that emits a tone at a known frequency offset from center
         long centerHz = 154_000_000L;
         double sampleRate = 2_000_000.0; // 2 Msps
         int bufferSize = 1024;
 
-        // Build a fake complex source that returns a simple sine tone
-        // Tone at 200 kHz offset from center (bin index ≈ 200000/sampleRate*FFT_SIZE = 409 at 4096 bins)
-        FakeComplexSource fakeSource = new FakeComplexSource(sampleRate, centerHz);
-        int numBuffers = 40;
-        float[] iBuffer = new float[bufferSize];
-        float[] qBuffer = new float[bufferSize];
-
-        // 200 kHz tone
-        double freq = 200_000.0;
+        // Tone at 200 kHz offset from center.
+        // At 4096 FFT bins and 2 Msps, bin width = ~488 Hz.
+        // Expected tone bin (after fftshift) ≈ 4096/2 + 200000/488 ≈ 2048 + 410 = bin 2458.
+        // Expected center frequency ≈ centerHz + 200 kHz = 154_200_000 Hz.
+        double toneOffsetHz = 200_000.0;
+        long expectedToneHz = centerHz + (long) toneOffsetHz;
         float amplitude = 0.5f;
-        for(int n = 0; n < bufferSize; n++)
-        {
-            double phase = 2.0 * Math.PI * freq * n / sampleRate;
-            iBuffer[n] = (float)(amplitude * Math.cos(phase));
-            qBuffer[n] = (float)(amplitude * Math.sin(phase));
-        }
 
-        // The fake source will emit these buffers repeatedly
+        FakeComplexSource fakeSource = new FakeComplexSource(sampleRate, centerHz);
+
+        // Add AWGN noise at ~25 dB below the tone so we have a realistic noise floor.
+        // The tone occupies a narrow main lobe that stands ~25 dB above the noise,
+        // which greatly exceeds the 6 dB detection threshold.  Without noise, Hann-window
+        // leakage fills all bins and the noise-floor estimator cannot distinguish signal
+        // from leakage (every bin exceeds the threshold).
+        float noiseAmplitude = amplitude / (float) Math.sqrt(Math.pow(10.0, 25.0 / 10.0));
+        Random rng = new Random(42L); // fixed seed for reproducibility
+
+        // Supply enough buffers to fill the 4096-sample ring multiple times
+        int numBuffers = 40;
         for(int b = 0; b < numBuffers; b++)
         {
+            float[] iBuffer = new float[bufferSize];
+            float[] qBuffer = new float[bufferSize];
+
+            for(int n = 0; n < bufferSize; n++)
+            {
+                double phase = 2.0 * Math.PI * toneOffsetHz * (b * bufferSize + n) / sampleRate;
+                iBuffer[n] = (float)(amplitude * Math.cos(phase)) + noiseAmplitude * (float) rng.nextGaussian();
+                qBuffer[n] = (float)(amplitude * Math.sin(phase)) + noiseAmplitude * (float) rng.nextGaussian();
+            }
+
             fakeSource.addBuffer(iBuffer, qBuffer);
         }
 
-        // Seam: provider returns our fake source
         SpectralSurvey.SurveySourceProvider fakeProvider = (config, spec, name) -> fakeSource;
-
         SpectralSurvey survey = new SpectralSurvey(fakeProvider, mExecutor);
 
-        // Run a very short dwell (200 ms) so the test is fast
         List<EnergyPeak> peaks = survey.survey(
             centerHz - 1_000_000L,
             centerHz + 1_000_000L,
@@ -296,13 +306,21 @@ class SpectralSurveyTest
             null
         ).get(8, java.util.concurrent.TimeUnit.SECONDS);
 
-        assertNotNull(peaks, "Peaks should not be null");
+        assertNotNull(peaks, "Peaks must not be null");
+        assertEquals(1, peaks.size(),
+            "Should detect exactly one peak for the injected tone; got " + peaks.size());
 
-        // We should detect at least one peak (the injected tone)
-        // In a synthetic test with a clean tone the peak should be visible
-        // Note: if no frames accumulated (timing), we get empty — that is acceptable
-        // but we verify the call completed without error
-        mLog.info("Survey detected {} peaks with fake source", peaks.size());
+        EnergyPeak peak = peaks.get(0);
+
+        // Allow ±5 kHz tolerance (10 bins at ~488 Hz per bin)
+        long toleranceHz = 5_000L;
+        assertTrue(Math.abs(peak.centerFrequencyHz() - expectedToneHz) <= toleranceHz,
+            "Peak center should be within " + toleranceHz + " Hz of the tone at "
+                + expectedToneHz + " Hz; got " + peak.centerFrequencyHz() + " Hz");
+
+        mLog.info("Survey detected tone at {} Hz (expected {} Hz, delta {} Hz)",
+            peak.centerFrequencyHz(), expectedToneHz,
+            Math.abs(peak.centerFrequencyHz() - expectedToneHz));
     }
 
     @Test
@@ -323,10 +341,10 @@ class SpectralSurveyTest
 
     @Test
     @Timeout(5)
-    void survey_whenCancelled_completesCancelled() throws Exception
+    void survey_whenCancelled_completesCancelledAndReleasesSource() throws Exception
     {
         // A source that blocks (never completes naturally)
-        FakeComplexSource blockingSource = new FakeComplexSource(2_000_000.0, 154_000_000L);
+        TrackingFakeComplexSource blockingSource = new TrackingFakeComplexSource(2_000_000.0, 154_000_000L);
         // Don't add any buffers — it will just sit waiting
 
         SpectralSurvey.SurveySourceProvider blockingProvider = (config, spec, name) -> blockingSource;
@@ -345,6 +363,18 @@ class SpectralSurveyTest
         boolean wasCancelled = future.cancel(true);
         assertTrue(wasCancelled, "cancel() should return true");
         assertTrue(future.isCancelled(), "Future should be cancelled");
+
+        // Give the survey's worker thread a moment to run its finally block
+        long deadline = System.currentTimeMillis() + 2_000;
+        while(!blockingSource.wasStopped() && System.currentTimeMillis() < deadline)
+        {
+            Thread.sleep(20);
+        }
+
+        assertTrue(blockingSource.wasStopped(),
+            "Source stop() must be called when the survey is cancelled (tuner source released)");
+        assertTrue(blockingSource.wasDisposed(),
+            "Source dispose() must be called when the survey is cancelled");
     }
 
     // =========================================================================
@@ -439,6 +469,72 @@ class SpectralSurveyTest
         public void dispose()
         {
             mStopped = true;
+            mListener = null;
+        }
+    }
+
+    /**
+     * A {@link FakeComplexSource} variant that separately tracks whether
+     * {@link #stop()} and {@link #dispose()} were called.  Used to verify that the
+     * survey releases its tuner source when cancelled.
+     */
+    static class TrackingFakeComplexSource extends ComplexSource
+    {
+        private final double mSampleRate;
+        private final long mFrequency;
+        private volatile Listener<ComplexSamples> mListener;
+        private volatile boolean mStopped = false;
+        private volatile boolean mDisposed = false;
+
+        TrackingFakeComplexSource(double sampleRate, long frequency)
+        {
+            mSampleRate = sampleRate;
+            mFrequency = frequency;
+        }
+
+        boolean wasStopped()  { return mStopped; }
+        boolean wasDisposed() { return mDisposed; }
+
+        @Override
+        public SampleType getSampleType() { return SampleType.COMPLEX; }
+
+        @Override
+        public double getSampleRate() { return mSampleRate; }
+
+        @Override
+        public long getFrequency() { return mFrequency; }
+
+        @Override
+        public void setListener(Listener<ComplexSamples> listener) { mListener = listener; }
+
+        @Override
+        public void removeSourceEventListener() {}
+
+        @Override
+        public Listener<SourceEvent> getSourceEventListener() { return null; }
+
+        @Override
+        public void setSourceEventListener(Listener<SourceEvent> listener) {}
+
+        @Override
+        public void reset() {}
+
+        @Override
+        public void start()
+        {
+            // Does nothing — simulates a source that never delivers samples (blocking survey)
+        }
+
+        @Override
+        public void stop()
+        {
+            mStopped = true;
+        }
+
+        @Override
+        public void dispose()
+        {
+            mDisposed = true;
             mListener = null;
         }
     }
