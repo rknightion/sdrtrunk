@@ -33,9 +33,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.Future;
 import org.jtransforms.fft.FloatFFT_1D;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -445,40 +445,14 @@ public class SpectralSurvey implements SpectralSurveyApi
             progress.onProgress(1.0);
         }
 
-        double[] magnitudeAccumulator = accumulator.getMagnitudeAccumulator();
-
-        // Check if we accumulated any data at all
-        double maxAccumulated = 0.0;
-
-        for(double v : magnitudeAccumulator)
+        if(!accumulator.hasData())
         {
-            if(v > maxAccumulated) maxAccumulated = v;
-        }
-
-        if(maxAccumulated == 0.0)
-        {
-            // No samples received — return empty
+            // No frames were accumulated (no samples received)
             return Collections.emptyList();
         }
 
-        // Convert accumulated magnitude sum to dB
-        // Using 20*log10 for amplitude (voltage-like magnitude, not power)
-        float[] avgMagnitudesDb = new float[FFT_SIZE];
-
-        for(int n = 0; n < FFT_SIZE; n++)
-        {
-            double linearVal = magnitudeAccumulator[n];
-
-            if(linearVal > 0.0)
-            {
-                avgMagnitudesDb[n] = (float)(20.0 * Math.log10(linearVal));
-            }
-            else
-            {
-                // Use a very small value for silent bins
-                avgMagnitudesDb[n] = -200.0f;
-            }
-        }
+        // Power-domain average: 10·log10(avgPower + epsilon) per bin
+        float[] avgMagnitudesDb = accumulator.getAveragedPowerDb();
 
         // The FFT output is in "standard" (not fftshift) order: DC at index 0,
         // positive frequencies up to Nyquist, then negative frequencies.
@@ -508,24 +482,36 @@ public class SpectralSurvey implements SpectralSurveyApi
      * Holds all mutable state needed by the sample-listener callback so it can be
      * accessed from a lambda without violating the "effectively final" requirement.
      *
-     * <p>Maintains a ring buffer of the last {@code fftSize} I/Q samples. When
-     * the ring fills for the first time, and each time new samples overwrite the
-     * oldest entries, a new overlapping FFT frame is computed and its linear
-     * magnitudes are accumulated.</p>
+     * <p>Maintains a ring buffer of the last {@code fftSize} I/Q samples.  When the ring
+     * fills for the first time, and each time new samples overwrite the oldest entries, a
+     * new overlapping FFT frame is computed.  Each frame's per-bin power ({@code re²+im²})
+     * is added to a running sum; a frame counter tracks how many frames have been processed.
+     * The caller retrieves the <em>averaged power spectrum</em> via
+     * {@link #getAveragedPowerDb()}, which divides the running sums by the frame count and
+     * converts to dB ({@code 10·log10(avgPower + epsilon)}).</p>
+     *
+     * <p>This approach avoids the previous bug of {@code 20·log10(sum)} which returned
+     * {@code 20·log10(N·|X|)} instead of a genuine spectral average.</p>
      *
      * <p><b>Not thread-safe</b> — accessed only from the source's delivery thread.</p>
      */
     private static final class SampleAccumulator
     {
+        /** Tiny epsilon to avoid log(0) when a bin is silent. */
+        private static final double EPSILON = 1e-20;
+
         private final float[] mWindow;
         private final FloatFFT_1D mFft;
         private final int mFftSize;
         private final float[] mIRing;
         private final float[] mQRing;
         private final float[] mFftBuffer;
-        private final double[] mMagnitudeAccumulator;
+        /** Running sum of per-bin power (re²+im²) across all frames processed so far. */
+        private final double[] mPowerAccumulator;
         private int mRingPos = 0;
         private boolean mRingFull = false;
+        /** Number of FFT frames accumulated. */
+        private int mFrameCount = 0;
 
         SampleAccumulator(float[] window, FloatFFT_1D fft, int fftSize)
         {
@@ -535,10 +521,10 @@ public class SpectralSurvey implements SpectralSurveyApi
             mIRing = new float[fftSize];
             mQRing = new float[fftSize];
             mFftBuffer = new float[fftSize * 2];
-            mMagnitudeAccumulator = new double[fftSize];
+            mPowerAccumulator = new double[fftSize];
         }
 
-        /** Feeds a {@link ComplexSamples} buffer through the ring → FFT → accumulator pipeline. */
+        /** Feeds a {@link ComplexSamples} buffer through the ring → FFT → power-accumulator pipeline. */
         void process(ComplexSamples samples)
         {
             float[] iArr = samples.i();
@@ -571,19 +557,57 @@ public class SpectralSurvey implements SpectralSurveyApi
 
                 mFft.complexForward(mFftBuffer);
 
+                // Accumulate power (re²+im²) per bin
                 for(int n = 0; n < mFftSize; n++)
                 {
                     double re = mFftBuffer[2 * n];
                     double im = mFftBuffer[2 * n + 1];
-                    mMagnitudeAccumulator[n] += Math.sqrt(re * re + im * im);
+                    mPowerAccumulator[n] += re * re + im * im;
                 }
+
+                mFrameCount++;
             }
         }
 
-        /** Returns the accumulated magnitude sums (one entry per FFT bin). */
-        double[] getMagnitudeAccumulator()
+        /**
+         * Returns {@code true} if at least one FFT frame has been accumulated.
+         */
+        boolean hasData()
         {
-            return mMagnitudeAccumulator;
+            return mFrameCount > 0;
+        }
+
+        /**
+         * Computes the power-averaged magnitude spectrum in dB.
+         *
+         * <p>Each bin's value is {@code 10·log10(avgPower)} — a genuine power-domain average
+         * that removes the frame-count bias from the absolute dB values.  Bins with zero or
+         * very low power (below {@link #EPSILON}) are clamped to {@code -200 dBFS} to avoid
+         * log(0) and to keep the noise-floor estimator from being pulled to arbitrarily
+         * negative values by epsilon-level bins.</p>
+         *
+         * @return array of averaged power in dBFS (one entry per FFT bin); never null
+         */
+        float[] getAveragedPowerDb()
+        {
+            float[] result = new float[mFftSize];
+            double divisor = (mFrameCount > 0) ? mFrameCount : 1.0;
+
+            for(int n = 0; n < mFftSize; n++)
+            {
+                double avgPower = mPowerAccumulator[n] / divisor;
+
+                if(avgPower < EPSILON)
+                {
+                    result[n] = -200.0f;
+                }
+                else
+                {
+                    result[n] = (float)(10.0 * Math.log10(avgPower));
+                }
+            }
+
+            return result;
         }
     }
 
