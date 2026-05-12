@@ -70,11 +70,15 @@ public class ScanDialog extends Stage
     private static final Logger mLog = LoggerFactory.getLogger(ScanDialog.class);
 
     /**
-     * Conservative "wide scan" threshold: if the requested span exceeds this, the stepped-sweep
-     * warning is shown.  2 MHz is typical for RTL-SDR devices at mid-range sample rates.
-     * Phase 5 will replace this with the actual tuner bandwidth.
+     * Threshold for the stepped-sweep warning banner: if the requested span exceeds this,
+     * the operator is warned that the survey will retune the displayed tuner and may disrupt
+     * active decoding.  10 MHz matches typical wideband SDRs (Airspy R2, SDRplay RSP1A,
+     * RTL-SDR with upsampling); smaller devices will still trigger the banner for narrower spans.
+     *
+     * <p>TODO: thread the active tuner's sample rate in from {@link io.github.dsheirer.module.discovery.TunerControl}
+     * to make this threshold dynamic rather than a fixed constant.</p>
      */
-    private static final long STEPPED_SWEEP_WARNING_HZ = 2_000_000L;
+    private static final long STEPPED_SWEEP_WARNING_HZ = 10_000_000L;
 
     private final BandScanController mBandScanController;
     private final DiscoveryPreference mDiscoveryPreference;

@@ -418,9 +418,10 @@ public class SDRTrunk implements Listener<TunerEvent>
             mSpectralPanel.setClickToTuneController(clickToTuneController);
 
             // --- Band-scan controller (Phase 3 — no UI yet) -------------------
-            mSpectralSurvey = new SpectralSurvey(
-                (config, spec, name) -> (ComplexSource) mTunerManager.getSource(config, spec, name),
-                mDiscoveryExecutor);
+            // SpectralSurvey taps the tuner's full-rate wideband I/Q buffer directly
+            // (same stream as the live spectrum display) rather than going through the
+            // polyphase channelizer.  No source provider is needed.
+            mSpectralSurvey = new SpectralSurvey(mDiscoveryExecutor);
             mDiscoveryModel = new DiscoveryModel();
             // Wire a TunerControlImpl that always resolves to whichever tuner the spectral
             // display is currently showing — so the stepped sweep follows tuner switches.
