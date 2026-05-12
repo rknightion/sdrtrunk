@@ -362,13 +362,32 @@ A P25 Phase 1 trunked system or a mix of NBFM/DMR conventional channels is ideal
 
 ## 16. Known Limitations and Future Work
 
-### 16.1  Stepping sweep: active channels lose signal during retune
+### 16.1  Stepped sweep — implemented and wired
 
-When `surveyWide()` steps the tuner's center frequency, any `TunerChannelSource` instances
-already allocated against the tuner will lose signal for the duration of each step.
-This is documented in the ScanDialog warning banner and is expected behaviour.
-The tuner is restored in a `finally` block (including on cancel/error) so the disruption
-is bounded.
+The stepped sweep is implemented in `SpectralSurvey.surveyWide()` and wired as an automatic
+fallback in `BandScanController.runSurvey()`: when the in-band survey fails because the span
+exceeds the tuner's instantaneous bandwidth, the controller retries automatically with
+`surveyWide()` provided a `TunerControl` is available.
+
+**How it works:** `TunerControlImpl` is constructed in `SDRTrunk` with a
+`Supplier<TunerController>` bound to `SpectralDisplayPanel::getTunerController`.  This means
+the stepped sweep always commands whichever tuner the spectral display is currently showing,
+and `isAvailable()` returns `false` when no tuner is displayed (disabling the fallback).
+
+**Known disruption:** when `surveyWide()` steps the tuner's center frequency, any
+`TunerChannelSource` instances already allocated against that tuner will receive mistuned
+samples for the duration of each step.  This is documented in the `ScanDialog` warning banner
+("interrupts decoding on that tuner for the duration") and is expected behaviour.  The tuner
+center frequency is restored unconditionally in a `finally` block (including on cancel/error).
+Only the spectral display's currently-shown tuner is commandeered; other connected tuners are
+unaffected.
+
+**DC-spike avoidance (known limitation):** the stepped sweep allocates a channelizer channel
+at each step's center frequency via `SurveySourceProvider.acquire()`.  On SDRs with a DC-spike
+avoidance zone (`MiddleUnusableBandwidth` — e.g. RTL-SDR, RSP), the small region around each
+step center is not surveyed because that frequency range maps to the channelizer's unusable
+band.  A future redesign could tap the tuner's raw wideband buffer directly instead of going
+through the channelizer, covering that region at the cost of higher complexity.
 
 **Future work:** coordinate with `ChannelProcessingManager` to gracefully pause active
 channels before stepping and resume them after restoration.  This would require a new

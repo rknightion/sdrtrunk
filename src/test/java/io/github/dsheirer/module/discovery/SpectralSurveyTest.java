@@ -18,7 +18,6 @@
  */
 package io.github.dsheirer.module.discovery;
 
-import io.github.dsheirer.module.discovery.TunerControl;
 import io.github.dsheirer.sample.Listener;
 import io.github.dsheirer.sample.SampleType;
 import io.github.dsheirer.sample.complex.ComplexSamples;
@@ -51,6 +50,9 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class SpectralSurveyTest
 {
+    private static final org.slf4j.Logger mLog =
+        org.slf4j.LoggerFactory.getLogger(SpectralSurveyTest.class);
+
     /** Base frequency for test arrays: 154 MHz */
     private static final long BASE_FREQ_HZ = 154_000_000L;
 
@@ -383,9 +385,6 @@ class SpectralSurveyTest
     // =========================================================================
     // Helpers
     // =========================================================================
-
-    private static final org.slf4j.Logger mLog =
-        org.slf4j.LoggerFactory.getLogger(SpectralSurveyTest.class);
 
     /** Creates a float array of the given size filled with a constant value. */
     private static float[] makeFlat(int size, float value)
@@ -873,5 +872,91 @@ class SpectralSurveyTest
         // Restore must have happened
         assertEquals(startFreq, tunerControl.lastSetFreq(),
             "Tuner must be restored after a multi-step sweep that detected peaks");
+    }
+
+    /**
+     * Verifies that a signal seen in the overlap region of two adjacent steps is de-duplicated
+     * to a single peak by {@code mergePeaksCrossStep}.
+     *
+     * <p>Strategy: inject the same tone at every step so it appears in every step's output.
+     * After cross-step merging, the combined list should contain only ONE peak (or at most a
+     * small number) rather than one per step, proving the wider-tolerance merge is effective.</p>
+     */
+    @Test
+    @Timeout(20)
+    void surveyWide_duplicatePeaksInOverlapRegion_mergedToSinglePeak() throws Exception
+    {
+        long usableBw = 2_000_000L;
+        long startFreq = 150_000_000L;
+        long spanHz    = 6_000_000L;     // 3+ steps at 80% stride
+
+        // Place the tone at a fixed absolute frequency that falls in the overlap zone
+        // between step 1 and step 2.  Stride = 0.8 * 2 MHz = 1.6 MHz.
+        // Step 1 center ≈ startFreq + usableBw/2 = 151 MHz  → window [150, 152] MHz
+        // Step 2 center ≈ 151 + 1.6 = 152.6 MHz             → window [151.6, 153.6] MHz
+        // Overlap zone: [151.6, 152] MHz — place tone at 151.8 MHz
+        long toneAbsHz = startFreq + 1_800_000L; // 151.8 MHz
+
+        float amplitude = 0.5f;
+        float noiseAmplitude = amplitude / (float) Math.sqrt(Math.pow(10.0, 25.0 / 10.0));
+        Random rng = new Random(99L);
+        double sampleRate = usableBw;
+        int bufferSize = 512;
+        int numBuffers = 40;
+
+        SpectralSurvey.SurveySourceProvider toneProvider = (config, spec, name) ->
+        {
+            FakeComplexSource source = new FakeComplexSource(sampleRate, config.getFrequency());
+            long toneOffset = toneAbsHz - config.getFrequency(); // offset from this step's center
+
+            // Only inject the tone if this step's window covers the tone frequency
+            long stepMin = config.getFrequency() - (long)(sampleRate / 2);
+            long stepMax = config.getFrequency() + (long)(sampleRate / 2);
+
+            if(toneAbsHz >= stepMin && toneAbsHz <= stepMax)
+            {
+                for(int b = 0; b < numBuffers; b++)
+                {
+                    float[] iBuffer = new float[bufferSize];
+                    float[] qBuffer = new float[bufferSize];
+                    for(int n = 0; n < bufferSize; n++)
+                    {
+                        double phase = 2.0 * Math.PI * toneOffset * (b * bufferSize + n) / sampleRate;
+                        iBuffer[n] = (float)(amplitude * Math.cos(phase)) + noiseAmplitude * (float) rng.nextGaussian();
+                        qBuffer[n] = (float)(amplitude * Math.sin(phase)) + noiseAmplitude * (float) rng.nextGaussian();
+                    }
+                    source.addBuffer(iBuffer, qBuffer);
+                }
+            }
+            return source;
+        };
+
+        RecordingTunerControl tunerControl = new RecordingTunerControl(
+            startFreq, usableBw, 100_000_000L, 1_700_000_000L);
+
+        SpectralSurvey survey = new SpectralSurvey(toneProvider, mExecutor);
+
+        List<EnergyPeak> peaks = survey.surveyWide(startFreq, startFreq + spanHz,
+            Duration.ofSeconds(3), 6.0, tunerControl, null)
+            .get(18, java.util.concurrent.TimeUnit.SECONDS);
+
+        assertNotNull(peaks);
+
+        // The cross-step merge should collapse any duplicate from the two steps that both
+        // cover the 151.8 MHz tone into a single peak.  Use a tight tolerance (5 kHz) so
+        // we count only peaks that are genuinely at the tone frequency, not unrelated noise
+        // peaks that happen to fall within a wider window.
+        long toleranceHz = 5_000L;
+        long nearToneCount = peaks.stream()
+            .filter(p -> Math.abs(p.centerFrequencyHz() - toneAbsHz) <= toleranceHz)
+            .count();
+
+        // There must be exactly one peak near the tone (merged, not doubled)
+        assertTrue(nearToneCount >= 1,
+            "At least one peak should be near the tone at " + (toneAbsHz / 1_000_000.0) + " MHz");
+        assertTrue(nearToneCount <= 1,
+            "Cross-step duplicate near the tone (" + (toneAbsHz / 1_000_000.0) + " MHz) should "
+            + "merge to at most 1 peak within " + (toleranceHz / 1000) + " kHz; found "
+            + nearToneCount + " peaks — mergePeaksCrossStep did not de-duplicate the overlap zone");
     }
 }
