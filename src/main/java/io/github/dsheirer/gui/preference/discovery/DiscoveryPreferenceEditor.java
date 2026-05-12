@@ -23,8 +23,6 @@ import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.preference.discovery.DiscoveryPreference;
 import io.github.dsheirer.preference.discovery.OverlayDisplay;
 import java.time.Duration;
-import java.util.EnumMap;
-import java.util.Map;
 import javafx.geometry.Insets;
 import javafx.scene.control.CheckBox;
 import javafx.scene.control.ComboBox;
@@ -88,8 +86,7 @@ public class DiscoveryPreferenceEditor extends HBox
         mEditorPane.getChildren().add(scanSectionLabel);
 
         // Survey dwell
-        GridPane.setConstraints(new Label("Survey dwell (seconds):"), 0, ++row);
-        mEditorPane.getChildren().add(new Label("Survey dwell (seconds):"));
+        mEditorPane.add(new Label("Survey dwell (seconds):"), 0, ++row);
 
         Spinner<Integer> dwellSpinner = new Spinner<>(
             new SpinnerValueFactory.IntegerSpinnerValueFactory(1, 60,
@@ -204,26 +201,41 @@ public class DiscoveryPreferenceEditor extends HBox
         GridPane.setHgrow(sep3, Priority.ALWAYS);
         mEditorPane.getChildren().add(sep3);
 
-        // ---- Section: Default scan decoders (note: stored in DiscoveryPreference Phase 4) ---
-        // Note: the DiscoveryPreference Phase-1 stubs for getDefaultScanDecoders() and
-        // getExcludedDecoders() always return all primaries / empty set.  Persisted
-        // customisation of these sets is deferred to a follow-up; the checkboxes are shown
-        // here for UI completeness but only apply within the current session until the
-        // persistence layer is extended in a later phase.
-        Label decoderSectionLabel = new Label("Default Scan Decoders  (session-only in Phase 4)");
+        // ---- Section: Default scan decoders -----------------------------------------
+        Label decoderSectionLabel = new Label("Default Scan Decoders");
         decoderSectionLabel.setStyle("-fx-font-weight: bold;");
         mEditorPane.add(decoderSectionLabel, 0, ++row, 2, 1);
 
-        Map<DecoderType, CheckBox> decoderCbs = new EnumMap<>(DecoderType.class);
+        int decoderBaseRow = ++row;
+        int i = 0;
 
         for(DecoderType type : DecoderType.PRIMARY_DECODERS)
         {
             CheckBox cb = new CheckBox(type.getDisplayString());
             cb.setSelected(!mPreference.getExcludedDecoders().contains(type));
-            // Note: writes back to excluded set — deferred to full persistence in a later phase
-            decoderCbs.put(type, cb);
-            mEditorPane.add(cb, (row % 2 == 0) ? 0 : 1, ++row);
+
+            // Lay out in a 2-column grid: column 0 for even i, column 1 for odd i
+            mEditorPane.add(cb, i % 2, decoderBaseRow + i / 2);
+
+            final DecoderType decoderType = type;
+            cb.selectedProperty().addListener((obs, o, n) -> {
+                java.util.Set<DecoderType> excluded = new java.util.HashSet<>(mPreference.getExcludedDecoders());
+                if(Boolean.TRUE.equals(n))
+                {
+                    excluded.remove(decoderType);
+                }
+                else
+                {
+                    excluded.add(decoderType);
+                }
+                mPreference.setExcludedDecoders(excluded);
+            });
+
+            i++;
         }
+
+        // Advance row pointer past the decoder grid
+        row = decoderBaseRow + (DecoderType.PRIMARY_DECODERS.size() + 1) / 2;
 
         return mEditorPane;
     }

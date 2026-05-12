@@ -37,6 +37,8 @@ import java.util.Locale;
 import java.util.stream.Collectors;
 import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
+import javafx.beans.property.ReadOnlyObjectWrapper;
+import javafx.beans.property.ReadOnlyStringWrapper;
 import javafx.collections.transformation.SortedList;
 import javafx.geometry.Insets;
 import javafx.scene.control.Button;
@@ -167,11 +169,8 @@ public class DiscoveryEditor extends BorderPane
 
         if(best != null)
         {
-            final Discovery toSelect = best;
-            Platform.runLater(() -> {
-                mTable.getSelectionModel().select(toSelect);
-                mTable.scrollTo(toSelect);
-            });
+            mTable.getSelectionModel().select(best);
+            mTable.scrollTo(best);
         }
     }
 
@@ -216,6 +215,19 @@ public class DiscoveryEditor extends BorderPane
             )
         );
         mStateLabel.setMinWidth(120);
+        // Show error message as tooltip when state is ERROR
+        mBandScanController.scanStateProperty().addListener((obs, oldState, newState) -> {
+            if(newState == ScanState.ERROR)
+            {
+                String msg = mBandScanController.getLastErrorMessage();
+                mStateLabel.setTooltip(msg != null && !msg.isEmpty()
+                    ? new Tooltip(msg) : null);
+            }
+            else
+            {
+                mStateLabel.setTooltip(null);
+            }
+        });
 
         // "Add all ≥ N pips" combo + button
         mMinPipsCombo = new ComboBox<>();
@@ -296,50 +308,71 @@ public class DiscoveryEditor extends BorderPane
         mTable.setItems(sorted);
 
         // --- Column: State ---
-        TableColumn<Discovery, DiscoveryState> stateCol = new TableColumn<>("State");
-        stateCol.setCellValueFactory(f -> f.getValue().stateProperty());
+        // The cell value is a composite of stateProperty + createdChannelProperty, so we use
+        // the row's Discovery as the cell value and observe both observable properties.
+        TableColumn<Discovery, Discovery> stateCol = new TableColumn<>("State");
+        stateCol.setCellValueFactory(f -> new ReadOnlyObjectWrapper<>(f.getValue()));
         stateCol.setCellFactory(col -> new TableCell<>()
         {
-            @Override
-            protected void updateItem(DiscoveryState state, boolean empty)
             {
-                super.updateItem(state, empty);
+                // Re-render whenever the row item's state or createdChannel changes
+                itemProperty().addListener((obs, oldD, newD) -> {
+                    if(oldD != null)
+                    {
+                        oldD.stateProperty().removeListener(this::invalidated);
+                        oldD.createdChannelProperty().removeListener(this::invalidated);
+                    }
+                    if(newD != null)
+                    {
+                        newD.stateProperty().addListener(this::invalidated);
+                        newD.createdChannelProperty().addListener(this::invalidated);
+                    }
+                    render(newD);
+                });
+            }
 
-                if(empty || state == null)
+            private void invalidated(javafx.beans.Observable obs)
+            {
+                render(getItem());
+            }
+
+            private void render(Discovery d)
+            {
+                if(isEmpty() || d == null)
                 {
                     setText(null);
                     return;
                 }
-
-                Discovery d = getTableView().getItems().get(getIndex());
-
                 if(d.getCreatedChannel() != null)
                 {
                     setText("● live");
+                    return;
                 }
-                else
+                DiscoveryState state = d.getState();
+                setText(state == null ? null : switch(state)
                 {
-                    setText(switch(state)
-                    {
-                        case ENERGY_DETECTED -> "⚡ energy";
-                        case PROBING        -> "⏳ probing";
-                        case IDENTIFIED     -> "✓";
-                        case UNIDENTIFIED   -> "?";
-                        case KNOWN          -> "known";
-                        case ERROR          -> "✕";
-                    });
-                }
+                    case ENERGY_DETECTED -> "⚡ energy";
+                    case PROBING        -> "⏳ probing";
+                    case IDENTIFIED     -> "✓";
+                    case UNIDENTIFIED   -> "?";
+                    case KNOWN          -> "known";
+                    case ERROR          -> "✕";
+                });
+            }
+
+            @Override
+            protected void updateItem(Discovery d, boolean empty)
+            {
+                super.updateItem(d, empty);
+                render(empty ? null : d);
             }
         });
         stateCol.setPrefWidth(90);
 
         // --- Column: Frequency (MHz) ---
         TableColumn<Discovery, Long> freqCol = new TableColumn<>("Frequency");
-        freqCol.setCellValueFactory(f -> {
-            // Wrap the long in an observable using a simple property approach.
-            // Since centerFrequencyHz is immutable, a plain ReadOnlyObjectWrapper is fine.
-            return new javafx.beans.property.ReadOnlyObjectWrapper<>(f.getValue().getCenterFrequencyHz());
-        });
+        freqCol.setCellValueFactory(f ->
+            new ReadOnlyObjectWrapper<>(f.getValue().getCenterFrequencyHz()));
         freqCol.setCellFactory(col -> new TableCell<>()
         {
             @Override
@@ -356,7 +389,7 @@ public class DiscoveryEditor extends BorderPane
         // --- Column: Bandwidth ---
         TableColumn<Discovery, Integer> bwCol = new TableColumn<>("BW");
         bwCol.setCellValueFactory(f ->
-            new javafx.beans.property.ReadOnlyObjectWrapper<>(f.getValue().getBandwidthHz()));
+            new ReadOnlyObjectWrapper<>(f.getValue().getBandwidthHz()));
         bwCol.setCellFactory(col -> new TableCell<>()
         {
             @Override
@@ -385,7 +418,14 @@ public class DiscoveryEditor extends BorderPane
                     return;
                 }
 
-                Discovery d = getTableView().getItems().get(getIndex());
+                int idx = getIndex();
+                if(idx < 0 || idx >= getTableView().getItems().size())
+                {
+                    setText(null);
+                    return;
+                }
+
+                Discovery d = getTableView().getItems().get(idx);
                 SignalKind kind = d.getKind();
 
                 if(dt == null)
@@ -432,7 +472,7 @@ public class DiscoveryEditor extends BorderPane
         // --- Column: Power / SNR ---
         TableColumn<Discovery, Double> powerCol = new TableColumn<>("Power/SNR");
         powerCol.setCellValueFactory(f ->
-            new javafx.beans.property.ReadOnlyObjectWrapper<>(f.getValue().getPowerDb()));
+            new ReadOnlyObjectWrapper<>(f.getValue().getPowerDb()));
         powerCol.setCellFactory(col -> new TableCell<>()
         {
             @Override
@@ -446,7 +486,14 @@ public class DiscoveryEditor extends BorderPane
                     return;
                 }
 
-                Discovery d = getTableView().getItems().get(getIndex());
+                int idx = getIndex();
+                if(idx < 0 || idx >= getTableView().getItems().size())
+                {
+                    setText(null);
+                    return;
+                }
+
+                Discovery d = getTableView().getItems().get(idx);
                 setText(String.format(Locale.ROOT, "%.1f / %.1f dB", pwr, d.getSnrDb()));
             }
         });
@@ -481,18 +528,23 @@ public class DiscoveryEditor extends BorderPane
         lastSeenCol.setPrefWidth(75);
 
         // --- Column: Notes (metadata summary) ---
+        // Binds to metadataVersionProperty() so the cell re-renders whenever metadata changes.
         TableColumn<Discovery, String> notesCol = new TableColumn<>("Notes");
         notesCol.setCellValueFactory(f -> {
             Discovery d = f.getValue();
-            String notes = d.getMetadata().entrySet().stream()
-                .map(e -> e.getKey() + "=" + e.getValue())
-                .collect(Collectors.joining(", "));
-            return new javafx.beans.property.ReadOnlyStringWrapper(notes);
+            return Bindings.createStringBinding(
+                () -> d.getMetadata().entrySet().stream()
+                    .map(e -> e.getKey() + "=" + e.getValue())
+                    .collect(Collectors.joining(", ")),
+                d.metadataVersionProperty());
         });
         notesCol.setPrefWidth(200);
 
         // --- Column: Actions (+ / 👁 / ✕ / ↻) ---
-        TableColumn<Discovery, Void> actionsCol = new TableColumn<>("Actions");
+        // Using Discovery as the cell value so that updateItem re-fires when the row's
+        // observable properties change (state, createdChannel, watched).
+        TableColumn<Discovery, Discovery> actionsCol = new TableColumn<>("Actions");
+        actionsCol.setCellValueFactory(f -> new ReadOnlyObjectWrapper<>(f.getValue()));
         actionsCol.setCellFactory(col -> new TableCell<>()
         {
             private final Button mAddBtn    = new Button("+");
@@ -527,13 +579,16 @@ public class DiscoveryEditor extends BorderPane
 
             private Discovery getDiscovery()
             {
+                // Prefer the cell's item (set by cellValueFactory) for correctness
+                Discovery d = getItem();
+                if(d != null) return d;
                 int index = getIndex();
                 if(index < 0 || index >= getTableView().getItems().size()) return null;
                 return getTableView().getItems().get(index);
             }
 
             @Override
-            protected void updateItem(Void item, boolean empty)
+            protected void updateItem(Discovery item, boolean empty)
             {
                 super.updateItem(item, empty);
 
@@ -543,7 +598,7 @@ public class DiscoveryEditor extends BorderPane
                     return;
                 }
 
-                Discovery d = getDiscovery();
+                Discovery d = item != null ? item : getDiscovery();
 
                 if(d == null)
                 {

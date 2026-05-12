@@ -139,10 +139,8 @@ public class ScanDialog extends Stage
 
         // --- Stepped-sweep warning ---
         mSteppedWarningLabel = new Label(
-            "⚠  This range is wider than a typical SDR can see at once. "
-            + "Scanning it requires a stepped sweep (retuning the SDR) "
-            + "which is not yet implemented in Phase 4. "
-            + "The scan will likely report an error for very wide spans.");
+            "⚠  This range is wider than your SDR's bandwidth — it requires a stepped sweep "
+            + "that retunes the SDR and interrupts decoding.");
         mSteppedWarningLabel.setWrapText(true);
         mSteppedWarningLabel.setStyle(
             "-fx-background-color: #cc3300; -fx-text-fill: white; "

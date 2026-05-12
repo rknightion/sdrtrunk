@@ -75,6 +75,7 @@ public class DiscoveryPreference extends Preference
     private static final String KEY_KEEP_LISTENING_SECONDS   = "discovery.keep.listening.seconds";
     private static final String KEY_OVERLAY_DISPLAY          = "discovery.overlay.display";
     private static final String KEY_IGNORE_LIST              = "discovery.ignore.list";
+    private static final String KEY_EXCLUDED_DECODERS        = "discovery.excluded.decoders";
 
     // -------------------------------------------------------------------------
     // Defaults (package-visible for test verification)
@@ -133,6 +134,7 @@ public class DiscoveryPreference extends Preference
     private Integer  mKeepListeningSeconds;
     private OverlayDisplay mOverlayDisplay;
     private List<IgnoreRange> mIgnoreList;
+    private Set<DecoderType> mExcludedDecoders;
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -494,13 +496,74 @@ public class DiscoveryPreference extends Preference
      * Returns the set of decoder types the user has explicitly excluded from all
      * discovery probing.  Empty by default.
      *
+     * <p>The set is persisted as a comma-separated list of {@link DecoderType} names
+     * in the backing {@link java.util.prefs.Preferences} node.</p>
+     *
      * @return unmodifiable set of excluded decoders
      */
     public Set<DecoderType> getExcludedDecoders()
     {
-        // Phase 1 v1: no UI yet; always returns empty set.
-        // Persisted exclusions will be added in Phase 4's DiscoveryPreferenceEditor.
-        return Collections.emptySet();
+        if(mExcludedDecoders == null)
+        {
+            mExcludedDecoders = loadExcludedDecoders();
+        }
+        return Collections.unmodifiableSet(mExcludedDecoders);
+    }
+
+    /**
+     * Replaces the set of excluded decoders and persists the change.
+     *
+     * @param excluded the decoders to exclude; may be null or empty to clear the exclusion list
+     */
+    public void setExcludedDecoders(Set<DecoderType> excluded)
+    {
+        mExcludedDecoders = (excluded != null) ? EnumSet.copyOf(
+            excluded.isEmpty() ? EnumSet.noneOf(DecoderType.class) : excluded)
+            : EnumSet.noneOf(DecoderType.class);
+
+        if(mExcludedDecoders.isEmpty())
+        {
+            mPreferences.remove(KEY_EXCLUDED_DECODERS);
+        }
+        else
+        {
+            String csv = mExcludedDecoders.stream()
+                .map(Enum::name)
+                .collect(java.util.stream.Collectors.joining(","));
+            mPreferences.put(KEY_EXCLUDED_DECODERS, csv);
+        }
+
+        notifyPreferenceUpdated();
+    }
+
+    private Set<DecoderType> loadExcludedDecoders()
+    {
+        String raw = mPreferences.get(KEY_EXCLUDED_DECODERS, "");
+
+        if(raw == null || raw.isBlank())
+        {
+            return EnumSet.noneOf(DecoderType.class);
+        }
+
+        Set<DecoderType> result = EnumSet.noneOf(DecoderType.class);
+
+        for(String name : raw.split(","))
+        {
+            String trimmed = name.trim();
+            if(!trimmed.isEmpty())
+            {
+                try
+                {
+                    result.add(DecoderType.valueOf(trimmed));
+                }
+                catch(IllegalArgumentException e)
+                {
+                    mLog.warn("Unknown DecoderType in excluded-decoders preference: '{}'", trimmed);
+                }
+            }
+        }
+
+        return result;
     }
 
     // -------------------------------------------------------------------------
