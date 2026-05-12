@@ -531,6 +531,22 @@ public class SpectralSurvey implements SpectralSurveyApi
         long maxTunable = tunerControl.getMaxFrequencyHz();
         stepCenters.replaceAll(c -> Math.max(minTunable, Math.min(maxTunable, c)));
 
+        // Warn if the tunable range clips the requested span
+        long firstWindowLow = stepCenters.get(0) - usableBw / 2L;
+        long lastWindowHigh = stepCenters.get(stepCenters.size() - 1) + usableBw / 2L;
+        if(firstWindowLow > minHz)
+        {
+            mLog.warn("Stepped sweep: span truncated at low end — tuner minimum ({} MHz) is above "
+                + "requested start ({} MHz); coverage begins at {} MHz",
+                minTunable / 1_000_000.0, minHz / 1_000_000.0, firstWindowLow / 1_000_000.0);
+        }
+        if(lastWindowHigh < maxHz)
+        {
+            mLog.warn("Stepped sweep: span truncated at high end — tuner maximum ({} MHz) is below "
+                + "requested end ({} MHz); coverage ends at {} MHz",
+                maxTunable / 1_000_000.0, maxHz / 1_000_000.0, lastWindowHigh / 1_000_000.0);
+        }
+
         // Remove duplicate centers (can happen if range is much smaller than usable bandwidth,
         // which shouldn't occur in a stepped sweep but is harmless to guard against)
         stepCenters = stepCenters.stream().distinct().toList();
@@ -631,9 +647,11 @@ public class SpectralSurvey implements SpectralSurveyApi
             progress.onProgress(1.0);
         }
 
-        // Merge peaks across step boundaries (overlap regions may double-detect)
+        // Merge peaks across step boundaries using a wider tolerance to collapse duplicates
+        // that arise in the ~20% overlap zone between adjacent steps (where the same signal
+        // may appear in two consecutive steps with slightly different centroid positions).
         long binWidthHz = Math.max(1L, (usableBw / FFT_SIZE));
-        return Collections.unmodifiableList(mergePeaks(allPeaks, binWidthHz));
+        return Collections.unmodifiableList(mergePeaksCrossStep(allPeaks, binWidthHz));
     }
 
     // -------------------------------------------------------------------------
@@ -1037,6 +1055,11 @@ public class SpectralSurvey implements SpectralSurveyApi
     /**
      * Merges peaks whose center frequencies are within {@link #MIN_SEPARATION_BINS} bins of each other.
      *
+     * <p>This is the standard (tight) merge used within a single survey step.  For cross-step
+     * merging after a stepped sweep, use {@link #mergePeaksCrossStep(List, long)} instead, which
+     * applies a wider tolerance to collapse duplicates that arise in the 20% overlap region between
+     * adjacent steps.</p>
+     *
      * <p>When two peaks are merged, the result has:
      * <ul>
      *   <li>center = power-weighted mean of the two centers</li>
@@ -1102,6 +1125,92 @@ public class SpectralSurvey implements SpectralSurveyApi
 
                         result.add(new EnergyPeak(mergedCenter, mergedBw, mergedPower, mergedSnr));
                         i += 2; // skip both merged peaks
+                        merged = true;
+                        continue;
+                    }
+                }
+
+                result.add(sorted.get(i));
+                i++;
+            }
+
+            sorted = result;
+        }
+        while(merged);
+
+        return sorted;
+    }
+
+    /**
+     * Merges peaks from the combined cross-step peak list, using a wider tolerance that
+     * accounts for the same signal being detected in two overlapping step windows with
+     * slightly different centroid positions due to windowing offsets.
+     *
+     * <p>Two peaks are merged if their center frequencies differ by less than:</p>
+     * <pre>max(MIN_SEPARATION_BINS * binWidthHz, (occupiedBwA + occupiedBwB) / 2)</pre>
+     * <p>i.e. their occupied bands overlap or nearly overlap.  This collapses duplicates
+     * that arise in the ~20% step-edge overlap region without merging genuinely distinct
+     * signals that happen to be close together.</p>
+     *
+     * @param peaks      all peaks from all steps (may contain cross-step duplicates)
+     * @param binWidthHz Hz per FFT bin
+     * @return de-duplicated peak list, sorted by center frequency ascending
+     */
+    private static List<EnergyPeak> mergePeaksCrossStep(List<EnergyPeak> peaks, long binWidthHz)
+    {
+        if(peaks.size() <= 1)
+        {
+            return peaks;
+        }
+
+        List<EnergyPeak> sorted = new ArrayList<>(peaks);
+        sorted.sort((a, b) -> Long.compare(a.centerFrequencyHz(), b.centerFrequencyHz()));
+
+        long minSeparationHz = MIN_SEPARATION_BINS * binWidthHz;
+        boolean merged;
+
+        do
+        {
+            merged = false;
+            List<EnergyPeak> result = new ArrayList<>(sorted.size());
+            int i = 0;
+
+            while(i < sorted.size())
+            {
+                if(i + 1 < sorted.size())
+                {
+                    EnergyPeak a = sorted.get(i);
+                    EnergyPeak b = sorted.get(i + 1);
+                    long separation = b.centerFrequencyHz() - a.centerFrequencyHz();
+
+                    // Wider tolerance: merge if either the standard min-separation rule
+                    // applies, OR if the occupied bandwidths overlap (their half-widths
+                    // overlap, indicating the same physical signal seen from two steps).
+                    long overlapTolerance = (a.occupiedBandwidthHz() + b.occupiedBandwidthHz()) / 2L;
+                    long mergeThreshold = Math.max(minSeparationHz, overlapTolerance);
+
+                    if(separation < mergeThreshold)
+                    {
+                        double linearA = Math.pow(10.0, a.powerDb() / 10.0);
+                        double linearB = Math.pow(10.0, b.powerDb() / 10.0);
+                        double totalPower = linearA + linearB;
+                        long mergedCenter = (totalPower > 0.0)
+                            ? (long)((a.centerFrequencyHz() * linearA + b.centerFrequencyHz() * linearB)
+                                / totalPower)
+                            : (a.centerFrequencyHz() + b.centerFrequencyHz()) / 2;
+
+                        long aMin = a.centerFrequencyHz() - a.occupiedBandwidthHz() / 2L;
+                        long aMax = a.centerFrequencyHz() + a.occupiedBandwidthHz() / 2L;
+                        long bMin = b.centerFrequencyHz() - b.occupiedBandwidthHz() / 2L;
+                        long bMax = b.centerFrequencyHz() + b.occupiedBandwidthHz() / 2L;
+                        int mergedBw = (int)(Math.max(aMax, bMax) - Math.min(aMin, bMin));
+                        mergedBw = Math.max(mergedBw, 1);
+
+                        double mergedPower = Math.max(a.powerDb(), b.powerDb());
+                        double mergedSnr   = Math.max(a.snrDb(), b.snrDb());
+
+                        result.add(new EnergyPeak(mergedCenter, mergedBw, mergedPower, mergedSnr));
+                        i += 2;
                         merged = true;
                         continue;
                     }

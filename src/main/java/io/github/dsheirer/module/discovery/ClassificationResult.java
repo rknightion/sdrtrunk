@@ -54,6 +54,16 @@ public record ClassificationResult(
     double signalPowerDb,
     ProcessingChain liveChain)
 {
+    /**
+     * Compact constructor — null-coalesces {@code candidates} so that callers which
+     * stream the candidates list (e.g. {@code SDRTrunk.showMissPopup}) never NPE even
+     * when a result is constructed directly with {@code null} candidates.
+     */
+    public ClassificationResult
+    {
+        candidates = (candidates != null) ? candidates : List.of();
+    }
+
     // -------------------------------------------------------------------------
     // Static factory methods
     // -------------------------------------------------------------------------
