@@ -285,3 +285,139 @@ Each phase ends with `./gradlew build` green, the new unit tests passing, and a 
 - **Stepped sweep is the only thing that retunes the SDR**, always behind an explicit confirmation.
 - New code targets **upstream‑contribution quality**; no new runtime dependencies.
 - These are the kind of choices I'll make as I go; I'll only stop for ones that genuinely fork the design.
+
+---
+
+## 15. Manual Test Plan (Phase 5 — Stepped Sweep & Polish)
+
+These tests are designed for execution on a real SDR connected to an active RF environment.
+They complement the automated unit-test suite, which covers all logic paths with fakes.
+A P25 Phase 1 trunked system or a mix of NBFM/DMR conventional channels is ideal.
+
+### 15.1  Click-to-tune — happy path
+
+| Step | Expected |
+|------|----------|
+| 1. Open the spectral display while a known P25 control channel is visible as a peak. | — |
+| 2. Shift+drag a selection box centred on the peak (or double-click it). | Pending overlay appears at that span. |
+| 3. Wait ≤ 12 s for the classifier to lock. | Pending overlay clears; a channel strip appears at that frequency with decoder type "P25 Phase 1". |
+| 4. Observe that trunked traffic channels begin to follow. | Traffic channels are added dynamically as calls are dispatched. |
+| 5. Right-click the channel strip and choose "Decode here as… NBFM". | The channel's decoder switches to NBFM without creating a second channel. |
+| 6. Choose "Re-detect" from the same menu. | Classifier runs again; if P25 wins, the channel switches back to P25 Phase 1. |
+
+### 15.2  Click-to-tune — miss popup with "Keep listening"
+
+| Step | Expected |
+|------|----------|
+| 1. Click a frequency where a very-low-duty-cycle or intermittent signal appears. | Classifier times out (12 s default) → miss popup appears. |
+| 2. Note the popup title shows the outcome (e.g. "unidentified" or "no signal"). If the classifier saw any PARTIAL sync, the popup also shows "Start as &lt;decoder&gt;" button(s). | Popup text matches the outcome; PARTIAL buttons present only when applicable. |
+| 3. Press "Keep listening". | A new classification starts; pending overlay reappears. The probing window is now `DiscoveryPreference.keepListeningSeconds` seconds (default 30 s), NOT 30 Hz bandwidth. |
+| 4. If the signal becomes active, the classifier eventually locks. | Channel is created. |
+
+### 15.3  Click-to-tune — PARTIAL offer in miss popup
+
+| Step | Expected |
+|------|----------|
+| 1. Find a signal where e.g. P25 Phase 1 achieves brief sync but cannot sustain it (common on edge-of-range sites). | — |
+| 2. Click-to-tune. When miss popup appears, observe "Start as P25 Phase 1" button. | Button text matches the decoder that reached PARTIAL. |
+| 3. Press "Start as P25 Phase 1". | A P25 Phase 1 channel starts immediately at that frequency. |
+
+### 15.4  In-band band scan (non-disruptive)
+
+| Step | Expected |
+|------|----------|
+| 1. Open the Discovery tab (playlist window → "Discovery"). | Empty table. |
+| 2. Press "Scan". In the ScanDialog, set min/max frequency within the current tuner's instantaneous bandwidth (no stepped sweep warning). | No "disruption" warning banner is shown. |
+| 3. Press "Start". | Progress bar advances; table populates with detected signals. |
+| 4. Confirm the current tuner's center frequency is unchanged throughout. | Center frequency in the spectral display remains stable. |
+| 5. Press "Add" on an NBFM discovery. | A channel is added to the playlist and starts decoding immediately. |
+
+### 15.5  Wide stepped sweep (disruptive)
+
+| Step | Expected |
+|------|----------|
+| 1. In the ScanDialog, set min/max to a range wider than the tuner's instantaneous bandwidth (e.g. 140–170 MHz on an RTL-SDR). | A yellow warning banner appears: "Wide scan will retune the SDR…". |
+| 2. Acknowledge the warning and press "Start". | The spectral display shows the tuner stepping in ~80% bandwidth strides across the span. Existing channels on other frequencies lose signal (expected — the tuner has been moved). |
+| 3. After the sweep completes, confirm the tuner returns to its original center frequency. | Spectral display returns to the pre-scan view. Previously active channels resume. |
+| 4. Cancel partway through a stepped sweep. | Tuner is immediately restored to the original center frequency. No channels remain permanently disrupted. |
+
+### 15.6  Exclusion list and decoder filtering
+
+| Step | Expected |
+|------|----------|
+| 1. Open Discovery Preferences, add "AM" to the excluded decoder list. | — |
+| 2. Run a band scan over a range with known AM broadcasts. | AM signals may appear in the table with outcome UNIDENTIFIED (energy detected, no lock accepted). They do NOT appear as IDENTIFIED/AM because AM is excluded. |
+| 3. Remove AM from the exclusion list and re-scan. | AM signals now identify correctly. |
+
+### 15.7  Continuous re-scan
+
+| Step | Expected |
+|------|----------|
+| 1. Start a band scan with "Continuous" enabled and a 2-minute interval. | After the first cycle completes, the table shows results and state transitions to "idle (continuous)". |
+| 2. Wait for the interval to elapse. | A second survey begins automatically. Existing rows are refreshed (not duplicated). |
+| 3. Mark one UNIDENTIFIED row as "watched". | On the next rescan, that row is re-probed even if the survey returns no energy at its frequency. |
+| 4. Press "Stop". | Scanning halts; state returns to IDLE. |
+
+---
+
+## 16. Known Limitations and Future Work
+
+### 16.1  Stepping sweep: active channels lose signal during retune
+
+When `surveyWide()` steps the tuner's center frequency, any `TunerChannelSource` instances
+already allocated against the tuner will lose signal for the duration of each step.
+This is documented in the ScanDialog warning banner and is expected behaviour.
+The tuner is restored in a `finally` block (including on cancel/error) so the disruption
+is bounded.
+
+**Future work:** coordinate with `ChannelProcessingManager` to gracefully pause active
+channels before stepping and resume them after restoration.  This would require a new
+"suspend" lifecycle hook on `ProcessingChain`.
+
+### 16.2  No pre-classifier for modulation type
+
+Every candidate decoder is probed by actually running it against captured samples.  For a
+span with many signals this is CPU-intensive and slow.  The candidate set is bounded by
+`ScanRequest.maxSignalsToProbe` (default 200) and the decoder exclusion list.
+
+**Future work:** add a cheap modulation pre-classifier (e.g. instantaneous frequency
+variance for FM vs AM; symbol-rate estimation for digital modes) to prune the candidate
+set before full probing.
+
+### 16.3  No multi-tuner coordination
+
+The band-scan controller uses a single `SpectralSurveyApi` instance.  It cannot split a
+wide scan across multiple tuners or merge results from simultaneous in-band surveys on
+different hardware.
+
+**Future work:** implement a `MultiTunerSpectralSurvey` that parallelises the stepped
+sweep across available tuners, significantly reducing scan time for wide spans.
+
+### 16.4  ScanDialog owner window not set
+
+`ScanDialog` is created without a parent `Stage` (`initOwner` not called) because threading
+the `Stage` reference through `PlaylistEditor` → `DiscoveryEditor` → `ScanDialog` would
+require invasive changes across the JavaFX presenter layer.  The dialog is therefore not
+modal relative to the playlist window.
+
+**Future work:** pass the owner `Stage` during construction by exposing it via a narrow
+interface on `DiscoveryEditor`.
+
+### 16.5  Click-to-tune miss popup is a blocking JOptionPane
+
+The current miss popup uses `javax.swing.JOptionPane.showOptionDialog()`, which blocks the
+EDT while open.  For the initial implementation this is acceptable because the popup is
+short-lived and the operator is actively waiting.
+
+**Future work:** replace with a non-blocking Swing or JavaFX notification panel that the
+operator can dismiss at will without blocking other UI interactions.
+
+### 16.6  Classifier probing is not aware of existing channels
+
+The `BandScanController` skips peaks that overlap channels already in the channel model
+(`isKnownChannel`), but click-to-tune classifies blindly.  If the operator clicks a
+frequency already being decoded, a duplicate channel may be created.
+
+**Future work:** in `ClickToTuneController.classifyAndTune()`, check `ChannelModel` for
+an existing channel at the target frequency and offer to show/focus it instead of
+creating a new one.
