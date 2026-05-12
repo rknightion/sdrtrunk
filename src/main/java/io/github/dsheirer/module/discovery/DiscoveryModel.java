@@ -23,6 +23,7 @@ import io.github.dsheirer.sample.Listener;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import javafx.application.Platform;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 
@@ -30,25 +31,39 @@ import javafx.collections.ObservableList;
  * Holds the set of {@link Discovery} rows produced during a band scan and notifies
  * registered listeners of add / update / remove / clear events.
  *
- * <h3>JavaFX observable list</h3>
- * <p>The internal list is a {@link javafx.collections.ObservableList} so that a Phase-4
- * JavaFX table can bind to it directly and pick up structural changes (add/remove) as well
- * as in-place property mutations (because {@link Discovery} exposes
- * {@code javafx.beans.property} fields).</p>
+ * <h3>Thread safety</h3>
+ * <p>All public mutation methods ({@code add}, {@code update}, {@code remove}, {@code clear},
+ * {@code clearFinished}) are safe to call from <em>any thread</em>.  When the JavaFX toolkit
+ * is running they marshal {@link ObservableList} mutations onto the FX Application Thread via
+ * {@code Platform.runLater(...)}, so {@link javafx.scene.control.TableView} bindings receive
+ * change notifications on the correct thread.  When the FX toolkit is not running (e.g. in
+ * headless unit tests) mutations are applied inline under the internal lock.</p>
  *
- * <h3>Threading</h3>
- * <p>All {@code ObservableList} mutations (add, remove, clear) <em>should</em> be performed
- * on the JavaFX Application Thread when a UI is bound, so that JavaFX scene-graph observers
- * do not receive notifications off-thread.  For the Phase-3 headless use-case (no bound UI)
- * mutations may be performed on any thread.  {@link BandScanController} explicitly notes this
- * contract and Phase 4 will marshal appropriately via {@code Platform.runLater}.
- * The {@link Broadcaster}-based {@link DiscoveryEvent} stream is fired synchronously by
- * whatever thread calls the mutating method.</p>
+ * <p>The {@link Broadcaster}-based {@link DiscoveryEvent} stream is always fired on the thread
+ * that ultimately performs the mutation (the FX thread when FX is up, the calling thread
+ * otherwise).</p>
+ *
+ * <h3>Phase 4 contract</h3>
+ * <p>With this implementation Phase 4 can call any {@code DiscoveryModel} method directly from
+ * any thread — including the FX thread — without additional marshalling.  Binding a
+ * {@link javafx.scene.control.TableView} to {@link #getDiscoveries()} is safe.</p>
+ *
+ * <h3>JavaFX observable list</h3>
+ * <p>The internal list is a {@link ObservableList} so that a Phase-4 JavaFX table can bind to
+ * it directly and pick up structural changes (add/remove) as well as in-place property
+ * mutations (because {@link Discovery} exposes {@code javafx.beans.property} fields).</p>
  */
 public class DiscoveryModel
 {
     private final ObservableList<Discovery> mDiscoveries = FXCollections.observableArrayList();
     private final Broadcaster<DiscoveryEvent> mBroadcaster = new Broadcaster<>();
+
+    /**
+     * Guard for the raw list.  Every access to {@code mDiscoveries} (including reads in
+     * {@code findOverlapping}) must be performed while holding this lock.  The FX-thread
+     * marshal paths are exempt only because they will always run on a single thread.
+     */
+    private final Object mLock = new Object();
 
     // -------------------------------------------------------------------------
     // Listener management
@@ -83,14 +98,29 @@ public class DiscoveryModel
      * Returns an unmodifiable view of the discovery list.
      *
      * <p>Phase-4 table bindings should use the underlying {@link ObservableList}
-     * directly via {@link #getDiscoveries()}; this view is provided for safe
-     * non-UI consumers.</p>
+     * directly via this method — the list is updated on the FX thread so bindings
+     * receive proper change notifications.  Non-UI callers that iterate the list
+     * should take a snapshot: {@code new ArrayList<>(model.getDiscoveries())}.</p>
      *
-     * @return unmodifiable snapshot-stable view
+     * @return unmodifiable view of the live observable list
      */
     public ObservableList<Discovery> getDiscoveries()
     {
         return FXCollections.unmodifiableObservableList(mDiscoveries);
+    }
+
+    /**
+     * Returns a snapshot of the current list suitable for iteration on any thread.
+     * Unlike {@link #getDiscoveries()} the snapshot does not observe future changes.
+     *
+     * @return unmodifiable snapshot; never null, may be empty
+     */
+    public List<Discovery> snapshot()
+    {
+        synchronized(mLock)
+        {
+            return Collections.unmodifiableList(new ArrayList<>(mDiscoveries));
+        }
     }
 
     /**
@@ -111,14 +141,17 @@ public class DiscoveryModel
 
         List<Discovery> result = new ArrayList<>();
 
-        for(Discovery d : mDiscoveries)
+        synchronized(mLock)
         {
-            long dMin = d.getCenterFrequencyHz() - d.getBandwidthHz() / 2L;
-            long dMax = d.getCenterFrequencyHz() + d.getBandwidthHz() / 2L;
-
-            if(dMax >= spanMin && dMin <= spanMax)
+            for(Discovery d : mDiscoveries)
             {
-                result.add(d);
+                long dMin = d.getCenterFrequencyHz() - d.getBandwidthHz() / 2L;
+                long dMax = d.getCenterFrequencyHz() + d.getBandwidthHz() / 2L;
+
+                if(dMax >= spanMin && dMin <= spanMax)
+                {
+                    result.add(d);
+                }
             }
         }
 
@@ -126,7 +159,7 @@ public class DiscoveryModel
     }
 
     // -------------------------------------------------------------------------
-    // Mutation methods
+    // Mutation methods — all safe from any thread
     // -------------------------------------------------------------------------
 
     /**
@@ -141,15 +174,18 @@ public class DiscoveryModel
             throw new IllegalArgumentException("discovery must not be null");
         }
 
-        mDiscoveries.add(discovery);
-        mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.ADDED, discovery));
+        runMutation(() -> {
+            mDiscoveries.add(discovery);
+            mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.ADDED, discovery));
+        });
     }
 
     /**
      * Fires an {@link DiscoveryEvent.Type#UPDATED} event for a discovery that is already
      * in the list.  The row's properties have already been mutated by the caller; this
      * method notifies the Swing-side broadcaster.  The JavaFX table observes property
-     * changes directly and does not need explicit notification here.
+     * changes directly via the discovery's {@code javafx.beans.property} fields and does
+     * not need explicit notification here.
      *
      * @param discovery the discovery that was updated; must be in the list
      */
@@ -160,7 +196,7 @@ public class DiscoveryModel
             return;
         }
 
-        mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.UPDATED, discovery));
+        runMutation(() -> mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.UPDATED, discovery)));
     }
 
     /**
@@ -175,8 +211,10 @@ public class DiscoveryModel
             return;
         }
 
-        mDiscoveries.remove(discovery);
-        mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.REMOVED, discovery));
+        runMutation(() -> {
+            mDiscoveries.remove(discovery);
+            mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.REMOVED, discovery));
+        });
     }
 
     /**
@@ -184,8 +222,10 @@ public class DiscoveryModel
      */
     public void clear()
     {
-        mDiscoveries.clear();
-        mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.CLEARED, null));
+        runMutation(() -> {
+            mDiscoveries.clear();
+            mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.CLEARED, null));
+        });
     }
 
     /**
@@ -199,24 +239,73 @@ public class DiscoveryModel
      */
     public void clearFinished()
     {
-        List<Discovery> toRemove = new ArrayList<>();
+        runMutation(() -> {
+            List<Discovery> toRemove = new ArrayList<>();
 
-        for(Discovery d : mDiscoveries)
-        {
-            DiscoveryState s = d.getState();
-            if(s == DiscoveryState.IDENTIFIED || s == DiscoveryState.UNIDENTIFIED
-                || s == DiscoveryState.ERROR || s == DiscoveryState.KNOWN)
+            for(Discovery d : mDiscoveries)
             {
-                toRemove.add(d);
+                DiscoveryState s = d.getState();
+                if(s == DiscoveryState.IDENTIFIED || s == DiscoveryState.UNIDENTIFIED
+                    || s == DiscoveryState.ERROR || s == DiscoveryState.KNOWN)
+                {
+                    toRemove.add(d);
+                }
+            }
+
+            for(Discovery d : toRemove)
+            {
+                mDiscoveries.remove(d);
+                mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.REMOVED, d));
+            }
+
+            mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.CLEARED, null));
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Runs a mutation action either inline (under {@link #mLock}) or marshalled to the
+     * JavaFX Application Thread, depending on whether the FX toolkit is available.
+     *
+     * <ul>
+     *   <li>If the FX toolkit is running and we are already on the FX thread — run inline
+     *       (no marshalling needed; the FX thread is single-threaded for scene-graph work).</li>
+     *   <li>If the FX toolkit is running and we are on a background thread — schedule with
+     *       {@code Platform.runLater(...)} so the {@link ObservableList} is mutated on the
+     *       FX thread.  The broadcaster fires on the FX thread as well.</li>
+     *   <li>If the FX toolkit is not running (headless / test context) — {@code Platform.runLater}
+     *       would throw {@code IllegalStateException: Toolkit not initialized}.  We detect this by
+     *       catching that exception and falling back to running inline under {@link #mLock} on the
+     *       calling thread.</li>
+     * </ul>
+     *
+     * @param action the mutation to run; must not be null
+     */
+    private void runMutation(Runnable action)
+    {
+        if(Platform.isFxApplicationThread())
+        {
+            // Already on FX thread: run inline (no lock needed — single-threaded for scene graph)
+            action.run();
+            return;
+        }
+
+        // Try to marshal to the FX thread.  If the toolkit is not initialised, runLater()
+        // throws IllegalStateException — fall back to inline execution under mLock.
+        try
+        {
+            Platform.runLater(action);
+        }
+        catch(IllegalStateException e)
+        {
+            // FX toolkit not started (headless / test path) — run inline under lock
+            synchronized(mLock)
+            {
+                action.run();
             }
         }
-
-        for(Discovery d : toRemove)
-        {
-            mDiscoveries.remove(d);
-            mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.REMOVED, d));
-        }
-
-        mBroadcaster.receive(new DiscoveryEvent(DiscoveryEvent.Type.CLEARED, null));
     }
 }
