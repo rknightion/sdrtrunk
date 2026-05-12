@@ -141,6 +141,21 @@ class LockWatcherTest
     }
 
     @Test
+    void sustainedDataEvents_kindIsData() throws InterruptedException
+    {
+        sendEnoughToLock(State.DATA);
+        assertEquals(SignalKind.DATA, mWatcher.getKind());
+    }
+
+    @Test
+    void dataKindOverridesEarlierActiveState()
+    {
+        sendState(State.ACTIVE);
+        sendState(State.DATA);
+        assertEquals(SignalKind.DATA, mWatcher.getKind());
+    }
+
+    @Test
     void consecutiveCountWithoutTimeMet_isPartialNotLocked()
     {
         // Send LOCK_DEBOUNCE_COUNT events but without waiting for LOCK_DEBOUNCE_MS

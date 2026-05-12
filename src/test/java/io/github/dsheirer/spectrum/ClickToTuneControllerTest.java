@@ -41,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import javax.swing.SwingUtilities;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -74,7 +75,8 @@ class ClickToTuneControllerTest
     /** Fake SignalClassifier that returns a pre-configured future. */
     static class FakeSignalClassifier extends SignalClassifier
     {
-        private CompletableFuture<ClassificationResult> mNextResult;
+        private Function<io.github.dsheirer.module.discovery.ClassificationRequest,
+            CompletableFuture<ClassificationResult>> mResultProvider;
         /** Every ClassificationRequest received by classify(), in call order. */
         private final List<io.github.dsheirer.module.discovery.ClassificationRequest> mReceivedRequests
             = new ArrayList<>();
@@ -87,12 +89,18 @@ class ClickToTuneControllerTest
 
         void setNextResult(ClassificationResult result)
         {
-            mNextResult = CompletableFuture.completedFuture(result);
+            mResultProvider = request -> CompletableFuture.completedFuture(result);
         }
 
         void setNextResult(CompletableFuture<ClassificationResult> future)
         {
-            mNextResult = future;
+            mResultProvider = request -> future;
+        }
+
+        void setResultProvider(Function<io.github.dsheirer.module.discovery.ClassificationRequest,
+            CompletableFuture<ClassificationResult>> resultProvider)
+        {
+            mResultProvider = resultProvider;
         }
 
         List<io.github.dsheirer.module.discovery.ClassificationRequest> getReceivedRequests()
@@ -105,7 +113,7 @@ class ClickToTuneControllerTest
             io.github.dsheirer.module.discovery.ClassificationRequest request)
         {
             mReceivedRequests.add(request);
-            return mNextResult != null ? mNextResult : CompletableFuture.completedFuture(
+            return mResultProvider != null ? mResultProvider.apply(request) : CompletableFuture.completedFuture(
                 ClassificationResult.error(request.centerFrequencyHz(), "no result configured"));
         }
     }
@@ -283,6 +291,7 @@ class ClickToTuneControllerTest
         Channel channel = mFakeChannelModel.mAdded.get(0);
         assertEquals(DecoderType.NBFM, channel.getDecodeConfiguration().getDecoderType());
         assertEquals(FREQ, ((SourceConfigTuner) channel.getSourceConfiguration()).getFrequency());
+        assertTrue(channel.isTemporaryLive(), "Click-to-tune channels should start as temporary live channels");
         assertTrue(mController.getClickToTuneChannels().contains(channel));
     }
 
@@ -299,6 +308,11 @@ class ClickToTuneControllerTest
         assertEquals(ClassificationOutcome.NO_SIGNAL, mFakeUI.mMissResult.outcome());
         assertTrue(mFakeChannelModel.mAdded.isEmpty(), "No channel added on miss");
         assertTrue(mFakeCpm.mStarted.isEmpty());
+        assertEquals(expectedSearchFrequencies(FREQ),
+            mFakeClassifier.getReceivedRequests().stream()
+                .map(io.github.dsheirer.module.discovery.ClassificationRequest::centerFrequencyHz)
+                .toList(),
+            "Auto-detect should sweep around the clicked frequency before reporting a miss");
     }
 
     @Test
@@ -311,6 +325,47 @@ class ClickToTuneControllerTest
 
         assertNotNull(mFakeUI.mMissResult);
         assertEquals(ClassificationOutcome.UNIDENTIFIED, mFakeUI.mMissResult.outcome());
+    }
+
+    @Test
+    void classifyAndTune_searchesNearbyOffsetsUntilIdentified() throws Exception
+    {
+        long offsetFrequency = FREQ + 2_500L;
+
+        mFakeClassifier.setResultProvider(request ->
+        {
+            if(request.centerFrequencyHz() == offsetFrequency)
+            {
+                return CompletableFuture.completedFuture(ClassificationResult.identified(
+                    request.centerFrequencyHz(),
+                    List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.95, null)),
+                    DecoderType.NBFM,
+                    DecoderFactory.getDecodeConfiguration(DecoderType.NBFM),
+                    SignalKind.CONVENTIONAL,
+                    "NBFM",
+                    Map.of(),
+                    -80.0
+                ));
+            }
+
+            return CompletableFuture.completedFuture(
+                ClassificationResult.noSignal(request.centerFrequencyHz(), Double.NaN));
+        });
+
+        mController.classifyAndTune(FREQ, 12_500);
+        drainEdt();
+
+        assertEquals(List.of(FREQ, FREQ - 2_500L, FREQ + 2_500L),
+            mFakeClassifier.getReceivedRequests().stream()
+                .map(io.github.dsheirer.module.discovery.ClassificationRequest::centerFrequencyHz)
+                .toList(),
+            "Auto-detect should stop sweeping once a nearby frequency locks");
+
+        assertEquals(1, mFakeChannelModel.mAdded.size(), "Offset lock should create a channel");
+        Channel channel = mFakeChannelModel.mAdded.get(0);
+        assertEquals(offsetFrequency, ((SourceConfigTuner) channel.getSourceConfiguration()).getFrequency());
+        assertEquals("click-to-tune@" + FREQ + "+2500",
+            mFakeClassifier.getReceivedRequests().get(2).label());
     }
 
     @Test
@@ -350,6 +405,7 @@ class ClickToTuneControllerTest
         Channel channel = mFakeChannelModel.mAdded.get(0);
         assertEquals(DecoderType.P25_PHASE1, channel.getDecodeConfiguration().getDecoderType());
         assertEquals(FREQ, ((SourceConfigTuner) channel.getSourceConfiguration()).getFrequency());
+        assertTrue(channel.isTemporaryLive(), "Decode-here-as channels should start as temporary live channels");
     }
 
     @Test
@@ -666,12 +722,20 @@ class ClickToTuneControllerTest
         mFakeUI.mRedetectCallback.run();
         drainEdt();
 
-        // There should be exactly 2 classify() calls: one for classifyAndTune, one for keep-listening
         List<io.github.dsheirer.module.discovery.ClassificationRequest> requests =
             mFakeClassifier.getReceivedRequests();
-        assertEquals(2, requests.size(), "Exactly 2 classify calls expected");
+        List<io.github.dsheirer.module.discovery.ClassificationRequest> keepListeningRequests = requests.stream()
+            .filter(request -> request.label().startsWith("keep-listening@"))
+            .toList();
 
-        io.github.dsheirer.module.discovery.ClassificationRequest keepListeningRequest = requests.get(1);
+        assertEquals(expectedSearchFrequencies(FREQ).size() * 2, requests.size(),
+            "Initial classify and keep-listening should each sweep the click search offsets");
+        assertEquals(expectedSearchFrequencies(FREQ), keepListeningRequests.stream()
+                .map(io.github.dsheirer.module.discovery.ClassificationRequest::centerFrequencyHz)
+                .toList(),
+            "Keep-listening should sweep the same nearby offsets");
+
+        io.github.dsheirer.module.discovery.ClassificationRequest keepListeningRequest = keepListeningRequests.get(0);
 
         // The keep-listening deadline should be >= default (12 s) and match prefs
         Duration defaultDeadline = io.github.dsheirer.module.discovery.ClassificationRequest.DEFAULT_DEADLINE;
@@ -766,5 +830,17 @@ class ClickToTuneControllerTest
     {
         SwingUtilities.invokeAndWait(() -> {
         });
+    }
+
+    private static List<Long> expectedSearchFrequencies(long centerFrequencyHz)
+    {
+        return List.of(
+            centerFrequencyHz,
+            centerFrequencyHz - 2_500L,
+            centerFrequencyHz + 2_500L,
+            centerFrequencyHz - 5_000L,
+            centerFrequencyHz + 5_000L,
+            centerFrequencyHz - 7_500L,
+            centerFrequencyHz + 7_500L);
     }
 }

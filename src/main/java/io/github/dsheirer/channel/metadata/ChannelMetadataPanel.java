@@ -23,6 +23,7 @@ import com.google.common.base.Joiner;
 import io.github.dsheirer.alias.Alias;
 import io.github.dsheirer.channel.state.State;
 import io.github.dsheirer.controller.channel.Channel;
+import io.github.dsheirer.controller.channel.ChannelActions;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
 import io.github.dsheirer.eventbus.MyEventBus;
@@ -40,6 +41,8 @@ import io.github.dsheirer.sample.Broadcaster;
 import io.github.dsheirer.sample.Listener;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.text.DecimalFormat;
@@ -104,6 +107,7 @@ public class ChannelMetadataPanel extends JPanel implements ListSelectionListene
 
         mTable.getSelectionModel().addListSelectionListener(this);
         mTable.addMouseListener(new MouseSupport());
+        mTable.addKeyListener(new KeySupport());
 
         mTable.getColumnModel().getColumn(ChannelMetadataModel.COLUMN_DECODER_STATE)
             .setCellRenderer(new ColoredStateCellRenderer());
@@ -423,25 +427,37 @@ public class ChannelMetadataPanel extends JPanel implements ListSelectionListene
 
                 if(viewRowIndex >= 0)
                 {
-                    int modelRowIndex = mTable.convertRowIndexToModel(viewRowIndex);
+                    mTable.getSelectionModel().setSelectionInterval(viewRowIndex, viewRowIndex);
+                    Channel channel = getChannelAtViewRow(viewRowIndex);
 
-                    if(modelRowIndex >= 0)
+                    if(channel != null)
                     {
-                        ChannelMetadata metadata = mChannelProcessingManager.getChannelMetadataModel().getChannelMetadata(modelRowIndex);
+                        JMenuItem viewChannel = new JMenuItem("View/Edit: " + channel.getShortTitle());
+                        viewChannel.addActionListener(e2 ->
+                            MyEventBus.getGlobalEventBus().post(new ViewChannelRequest(channel)));
+                        popupMenu.add(viewChannel);
 
-                        if(metadata != null)
+                        if(channel.isProcessing())
                         {
-                            Channel channel = mChannelProcessingManager.getChannelMetadataModel()
-                                .getChannelFromMetadata(metadata);
-
-                            if(channel != null)
-                            {
-                                JMenuItem viewChannel = new JMenuItem("View/Edit: " + channel.getShortTitle());
-                                viewChannel.addActionListener(e2 -> MyEventBus.getGlobalEventBus().post(new ViewChannelRequest(channel)));
-                                popupMenu.add(viewChannel);
-                                populated = true;
-                            }
+                            JMenuItem stopChannel = new JMenuItem("Stop");
+                            stopChannel.addActionListener(e2 ->
+                                ChannelActions.stop(mChannelProcessingManager, channel));
+                            popupMenu.add(stopChannel);
                         }
+
+                        if(channel.isTemporaryLive())
+                        {
+                            JMenuItem saveChannel = new JMenuItem("Save to playlist");
+                            saveChannel.addActionListener(e2 -> ChannelActions.saveToPlaylist(channel));
+                            popupMenu.add(saveChannel);
+
+                            JMenuItem removeChannel = new JMenuItem("Remove live channel");
+                            removeChannel.addActionListener(e2 -> ChannelActions.removeTemporaryLive(mChannelModel,
+                                mChannelProcessingManager, channel));
+                            popupMenu.add(removeChannel);
+                        }
+
+                        populated = true;
                     }
                 }
 
@@ -453,6 +469,51 @@ public class ChannelMetadataPanel extends JPanel implements ListSelectionListene
                 popupMenu.show(mTable, e.getX(), e.getY());
             }
         }
+    }
+
+    public class KeySupport extends KeyAdapter
+    {
+        @Override
+        public void keyPressed(KeyEvent e)
+        {
+            if(e.getKeyCode() == KeyEvent.VK_DELETE)
+            {
+                Channel channel = getSelectedChannel();
+
+                if(channel != null && channel.isTemporaryLive())
+                {
+                    ChannelActions.removeTemporaryLive(mChannelModel, mChannelProcessingManager, channel);
+                    e.consume();
+                }
+            }
+        }
+    }
+
+    private Channel getSelectedChannel()
+    {
+        int viewRowIndex = mTable.getSelectedRow();
+        return viewRowIndex >= 0 ? getChannelAtViewRow(viewRowIndex) : null;
+    }
+
+    private Channel getChannelAtViewRow(int viewRowIndex)
+    {
+        if(viewRowIndex >= 0)
+        {
+            int modelRowIndex = mTable.convertRowIndexToModel(viewRowIndex);
+
+            if(modelRowIndex >= 0)
+            {
+                ChannelMetadata metadata = mChannelProcessingManager.getChannelMetadataModel()
+                    .getChannelMetadata(modelRowIndex);
+
+                if(metadata != null)
+                {
+                    return mChannelProcessingManager.getChannelMetadataModel().getChannelFromMetadata(metadata);
+                }
+            }
+        }
+
+        return null;
     }
 
     /**

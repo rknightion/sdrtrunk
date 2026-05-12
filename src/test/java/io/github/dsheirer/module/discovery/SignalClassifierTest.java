@@ -212,7 +212,12 @@ class SignalClassifierTest
             // LOCKED requires both count debounce AND time debounce (LockWatcher.LOCK_DEBOUNCE_MS).
             if(targetState == LockState.LOCKED)
             {
-                State reportState = (kind == SignalKind.CONTROL) ? State.CONTROL : State.CALL;
+                State reportState = switch(kind)
+                {
+                    case CONTROL -> State.CONTROL;
+                    case DATA -> State.DATA;
+                    default -> State.CALL;
+                };
                 for(int i = 0; i < LockWatcher.LOCK_DEBOUNCE_COUNT - 1; i++)
                 {
                     watcher.getDecoderStateListener().receive(

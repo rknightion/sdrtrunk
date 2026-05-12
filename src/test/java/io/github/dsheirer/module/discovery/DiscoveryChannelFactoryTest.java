@@ -73,6 +73,7 @@ class DiscoveryChannelFactoryTest
         assertEquals(DecoderType.NBFM, channel.getDecodeConfiguration().getDecoderType());
         assertTrue(channel.getSourceConfiguration() instanceof SourceConfigTuner);
         assertEquals(FREQ, ((SourceConfigTuner) channel.getSourceConfiguration()).getFrequency());
+        assertTrue(channel.isTemporaryLive(), "Auto-detected channels should start as temporary live channels");
     }
 
     @Test
@@ -151,6 +152,7 @@ class DiscoveryChannelFactoryTest
         assertEquals(DecoderType.NBFM, channel.getDecodeConfiguration().getDecoderType());
         assertEquals(FREQ, ((SourceConfigTuner) channel.getSourceConfiguration()).getFrequency());
         assertEquals("MyList", channel.getAliasListName());
+        assertTrue(channel.isTemporaryLive(), "Manual decode-here channels should start as temporary live channels");
     }
 
     @Test
@@ -192,6 +194,13 @@ class DiscoveryChannelFactoryTest
     {
         String name = DiscoveryChannelFactory.buildChannelName(FREQ, SignalKind.CONTROL);
         assertEquals("Discovered 154.920 (control)", name);
+    }
+
+    @Test
+    void buildChannelName_data_hasDataSuffix()
+    {
+        String name = DiscoveryChannelFactory.buildChannelName(FREQ, SignalKind.DATA);
+        assertEquals("Discovered 154.920 (data)", name);
     }
 
     @Test

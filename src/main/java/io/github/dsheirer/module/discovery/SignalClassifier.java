@@ -492,10 +492,13 @@ public class SignalClassifier implements Classifier
                                          ClassificationSession session, long freqHz,
                                          List<Candidate> candidates)
     {
+        ProbeChain pc = null;
+        ComplexSource subscriberSource = null;
+
         try
         {
-            ProbeChain pc = mProbeChainFactory.build(decoderType);
-            ComplexSource subscriberSource = fanout.newSubscriberSource();
+            pc = mProbeChainFactory.build(decoderType);
+            subscriberSource = fanout.newSubscriberSource();
 
             // Register with session immediately after build, before setSource/start,
             // so a mid-setup exception cannot leak a running chain.
@@ -506,10 +509,22 @@ public class SignalClassifier implements Classifier
                 pc.chain().start();
             }
 
-            return pc;
+            return new ProbeChain(pc.decoderType(), pc.chain(), pc.lockWatcher(), subscriberSource);
         }
         catch(Exception e)
         {
+            if(subscriberSource != null)
+            {
+                fanout.removeSubscriberSource(subscriberSource);
+            }
+
+            if(pc != null && pc.chain() != null)
+            {
+                session.removeProbeChain(pc.chain());
+                try { pc.chain().stop(); } catch(Exception ex) { mLog.debug("Stop error for failed probe chain", ex); }
+                try { pc.chain().dispose(); } catch(Exception ex) { mLog.debug("Dispose error for failed probe chain", ex); }
+            }
+
             mLog.warn("SignalClassifier: error launching probe for {} at {} Hz: {}",
                 decoderType, freqHz, e.getMessage());
             candidates.add(new Candidate(decoderType, LockState.ERROR, 0.0, e.getMessage()));
@@ -522,6 +537,11 @@ public class SignalClassifier implements Classifier
      */
     private void tearDownChain(ProbeChain pc, ClassificationSession session, ComplexSampleFanout fanout)
     {
+        if(pc.source() != null)
+        {
+            fanout.removeSubscriberSource(pc.source());
+        }
+
         if(pc.chain() != null)
         {
             session.removeProbeChain(pc.chain());

@@ -229,7 +229,7 @@ public class Discovery
     }
 
     /**
-     * Signal kind (CONTROL, CONVENTIONAL, TRAFFIC, UNKNOWN).
+     * Signal kind (CONTROL, DATA, CONVENTIONAL, TRAFFIC, UNKNOWN).
      *
      * @return signal kind
      */

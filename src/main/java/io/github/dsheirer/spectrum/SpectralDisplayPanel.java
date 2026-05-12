@@ -21,6 +21,7 @@ package io.github.dsheirer.spectrum;
 import com.jidesoft.swing.JideSplitPane;
 import io.github.dsheirer.buffer.INativeBuffer;
 import io.github.dsheirer.controller.channel.Channel;
+import io.github.dsheirer.controller.channel.ChannelActions;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
 import io.github.dsheirer.dsp.filter.smoothing.SmoothingFilter.SmoothingType;
@@ -39,6 +40,7 @@ import io.github.dsheirer.settings.SettingsManager;
 import io.github.dsheirer.source.ISourceEventProcessor;
 import io.github.dsheirer.source.SourceEvent;
 import io.github.dsheirer.source.tuner.Tuner;
+import io.github.dsheirer.source.tuner.TunerController;
 import io.github.dsheirer.source.tuner.manager.DiscoveredTuner;
 import io.github.dsheirer.source.tuner.ui.DiscoveredTunerModel;
 import io.github.dsheirer.spectrum.OverlayPanel.ChannelDisplay;
@@ -879,7 +881,7 @@ public class SpectralDisplayPanel extends JPanel
             if(SwingUtilities.isLeftMouseButton(event)
                 && event.getClickCount() == 2
                 && mClickToTuneController != null
-                && event.getComponent() == mOverlayPanel)
+                && (event.getComponent() == mOverlayPanel || event.getComponent() == mWaterfallPanel))
             {
                 long freq = mOverlayPanel.getFrequencyFromAxis(event.getX());
                 // Pending overlay is shown via UICallbacks.showPending() inside classifyAndTune
@@ -899,69 +901,8 @@ public class SpectralDisplayPanel extends JPanel
 
                 long frequency = mOverlayPanel.getFrequencyFromAxis(event.getX());
 
-                if(event.getComponent() == mOverlayPanel)
-                {
-                    ArrayList<Channel> channels = mOverlayPanel.getChannelsAtFrequency(frequency);
-
-                    JMenu channelMenu = new JMenu("Channels");
-                    for(Channel channel : channels)
-                    {
-                        JMenuItem viewChannel = new JMenuItem("View/Edit: " + channel.getShortTitle());
-                        viewChannel.addActionListener(
-                                e -> MyEventBus.getGlobalEventBus().post(new ViewChannelRequest(channel)));
-                        channelMenu.add(viewChannel);
-
-                        // If this channel was created by click-to-tune, add decoder-change items
-                        if(mClickToTuneController != null
-                            && mClickToTuneController.getClickToTuneChannels().contains(channel))
-                        {
-                            JMenu changeDecoder = new JMenu("Change decoder");
-                            for(DecoderType type : DecoderType.PRIMARY_DECODERS)
-                            {
-                                JMenuItem decoderItem = new JMenuItem(type.getShortDisplayString());
-                                decoderItem.addActionListener(ev ->
-                                    mClickToTuneController.changeDecoder(channel, type));
-                                changeDecoder.add(decoderItem);
-                            }
-
-                            channelMenu.add(changeDecoder);
-
-                            JMenuItem redetect = new JMenuItem("Re-detect…");
-                            redetect.addActionListener(ev -> mClickToTuneController.redetect(channel));
-                            channelMenu.add(redetect);
-                        }
-                    }
-
-                    contextMenu.add(channelMenu);
-
-                    if(!channels.isEmpty())
-                    {
-                        contextMenu.add(new JSeparator());
-                    }
-
-                    // --- Click-to-tune items (only when controller is wired) ---
-                    if(mClickToTuneController != null)
-                    {
-                        JMenuItem autoDetect = new JMenuItem("Decode here (auto-detect)");
-                        final long clickFreq = frequency;
-                        // Pending overlay is shown via UICallbacks.showPending() inside classifyAndTune
-                        autoDetect.addActionListener(ev ->
-                            mClickToTuneController.classifyAndTune(clickFreq, 0));
-                        contextMenu.add(autoDetect);
-
-                        JMenu decodeAsMenu = new JMenu("Decode here as");
-                        for(DecoderType type : DecoderType.PRIMARY_DECODERS)
-                        {
-                            final DecoderType dt = type;
-                            JMenuItem item = new JMenuItem(type.getDisplayString());
-                            item.addActionListener(ev -> mClickToTuneController.tuneAs(clickFreq, dt));
-                            decodeAsMenu.add(item);
-                        }
-
-                        contextMenu.add(decodeAsMenu);
-                        contextMenu.add(new JSeparator());
-                    }
-                }
+                addChannelContextMenuItems(contextMenu, frequency);
+                addClickToTuneContextMenuItems(contextMenu, frequency);
 
                 /**
                  * Color Menus
@@ -1122,8 +1063,9 @@ public class SpectralDisplayPanel extends JPanel
 
                     JMenuItem scanView = new JMenuItem("Scan this view…");
                     scanView.addActionListener(ev -> {
-                        long minHz = mOverlayPanel.getMinFrequency();
-                        long maxHz = mOverlayPanel.getMaxFrequency();
+                        long[] span = getCurrentTunerScanSpan();
+                        long minHz = span[0];
+                        long maxHz = span[1];
 
                         if(minHz > 0 && maxHz > minHz)
                         {
@@ -1152,6 +1094,136 @@ public class SpectralDisplayPanel extends JPanel
                 }
             }
         }
+    }
+
+    /**
+     * Adds channel actions for the clicked frequency.
+     */
+    private void addChannelContextMenuItems(JPopupMenu contextMenu, long frequency)
+    {
+        ArrayList<Channel> channels = mOverlayPanel.getChannelsAtFrequency(frequency);
+
+        JMenu channelMenu = new JMenu("Channels");
+        channelMenu.setEnabled(!channels.isEmpty());
+
+        for(Channel channel : channels)
+        {
+            JMenuItem viewChannel = new JMenuItem("View/Edit: " + channel.getShortTitle());
+            viewChannel.addActionListener(
+                e -> MyEventBus.getGlobalEventBus().post(new ViewChannelRequest(channel)));
+            channelMenu.add(viewChannel);
+
+            if(channel.isProcessing())
+            {
+                JMenuItem stopChannel = new JMenuItem("Stop: " + channel.getShortTitle());
+                stopChannel.addActionListener(e ->
+                    ChannelActions.stop(mChannelProcessingManager, channel));
+                channelMenu.add(stopChannel);
+            }
+
+            if(channel.isTemporaryLive())
+            {
+                JMenuItem saveChannel = new JMenuItem("Save to playlist: " + channel.getShortTitle());
+                saveChannel.addActionListener(e -> ChannelActions.saveToPlaylist(channel));
+                channelMenu.add(saveChannel);
+
+                JMenuItem removeChannel = new JMenuItem("Remove live channel: " + channel.getShortTitle());
+                removeChannel.addActionListener(e ->
+                    ChannelActions.removeTemporaryLive(mChannelModel, mChannelProcessingManager, channel));
+                channelMenu.add(removeChannel);
+            }
+
+            // If this channel was created by click-to-tune, add decoder-change items
+            if(mClickToTuneController != null
+                && mClickToTuneController.getClickToTuneChannels().contains(channel))
+            {
+                JMenu changeDecoder = new JMenu("Change decoder");
+                for(DecoderType type : DecoderType.PRIMARY_DECODERS)
+                {
+                    JMenuItem decoderItem = new JMenuItem(type.getShortDisplayString());
+                    decoderItem.addActionListener(ev ->
+                        mClickToTuneController.changeDecoder(channel, type));
+                    changeDecoder.add(decoderItem);
+                }
+
+                channelMenu.add(changeDecoder);
+
+                JMenuItem redetect = new JMenuItem("Re-detect…");
+                redetect.addActionListener(ev -> mClickToTuneController.redetect(channel));
+                channelMenu.add(redetect);
+            }
+        }
+
+        contextMenu.add(channelMenu);
+
+        if(!channels.isEmpty())
+        {
+            contextMenu.add(new JSeparator());
+        }
+    }
+
+    /**
+     * Adds live decode actions for the clicked frequency.
+     */
+    private void addClickToTuneContextMenuItems(JPopupMenu contextMenu, long frequency)
+    {
+        if(mClickToTuneController == null)
+        {
+            return;
+        }
+
+        final long clickFreq = frequency;
+
+        JMenuItem monitorNbfm = new JMenuItem("Monitor here (NBFM 12.5 kHz)");
+        monitorNbfm.addActionListener(ev -> mClickToTuneController.tuneAs(clickFreq, DecoderType.NBFM));
+        contextMenu.add(monitorNbfm);
+
+        JMenuItem autoDetect = new JMenuItem("Decode here (auto-detect)");
+        // Pending overlay is shown via UICallbacks.showPending() inside classifyAndTune
+        autoDetect.addActionListener(ev ->
+            mClickToTuneController.classifyAndTune(clickFreq, 0));
+        contextMenu.add(autoDetect);
+
+        JMenu decodeAsMenu = new JMenu("Decode here as");
+        for(DecoderType type : DecoderType.PRIMARY_DECODERS)
+        {
+            final DecoderType dt = type;
+            JMenuItem item = new JMenuItem(type.getDisplayString());
+            item.addActionListener(ev -> mClickToTuneController.tuneAs(clickFreq, dt));
+            decodeAsMenu.add(item);
+        }
+
+        contextMenu.add(decodeAsMenu);
+        contextMenu.add(new JSeparator());
+    }
+
+    /**
+     * Builds a discovery scan span centered on the active SDR center frequency.
+     */
+    long[] getCurrentTunerScanSpan()
+    {
+        long centerHz = 0L;
+        long widthHz = 0L;
+
+        if(mTuner != null && mTuner.getTunerController() != null)
+        {
+            TunerController controller = mTuner.getTunerController();
+            centerHz = controller.getFrequency();
+            widthHz = controller.getUsableBandwidth();
+        }
+
+        if(centerHz <= 0)
+        {
+            centerHz = mOverlayPanel.getMinFrequency() + ((mOverlayPanel.getMaxFrequency() - mOverlayPanel.getMinFrequency()) / 2L);
+        }
+
+        if(widthHz <= 0)
+        {
+            widthHz = mOverlayPanel.getMaxFrequency() - mOverlayPanel.getMinFrequency();
+        }
+
+        long halfWidth = widthHz / 2L;
+        return new long[]{centerHz - halfWidth, centerHz + halfWidth};
     }
 
     /**

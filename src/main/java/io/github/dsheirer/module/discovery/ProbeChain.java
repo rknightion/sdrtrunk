@@ -20,6 +20,7 @@ package io.github.dsheirer.module.discovery;
 
 import io.github.dsheirer.module.ProcessingChain;
 import io.github.dsheirer.module.decode.DecoderType;
+import io.github.dsheirer.source.ComplexSource;
 
 /**
  * A lightweight container pairing a transient probe {@link ProcessingChain} with its
@@ -28,9 +29,15 @@ import io.github.dsheirer.module.decode.DecoderType;
  * @param decoderType the protocol this chain is probing
  * @param chain       the probe chain (decoder-only; no audio/log/recorder modules); must not be null
  * @param lockWatcher the watcher observing this chain's decoder-state events; must not be null
+ * @param source      the fanout subscriber source feeding the probe chain; may be null before launch
  */
-public record ProbeChain(DecoderType decoderType, ProcessingChain chain, LockWatcher lockWatcher)
+public record ProbeChain(DecoderType decoderType, ProcessingChain chain, LockWatcher lockWatcher, ComplexSource source)
 {
+    public ProbeChain(DecoderType decoderType, ProcessingChain chain, LockWatcher lockWatcher)
+    {
+        this(decoderType, chain, lockWatcher, null);
+    }
+
     /**
      * Compact constructor validating that neither {@code chain} nor {@code lockWatcher} is null.
      */

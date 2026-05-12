@@ -85,11 +85,32 @@ public class MP3AudioConverter implements IAudioConverter
      */
     public List<byte[]> convert(List<float[]> audioPackets)
     {
+        List<byte[]> converted = convertStreaming(audioPackets);
+
+        int finalChunkSize = mEncoder.encodeFinish(mOutputFramesBuffer);
+
+        if(finalChunkSize > 0)
+        {
+            converted.add(Arrays.copyOf(mOutputFramesBuffer, finalChunkSize));
+        }
+
+        return converted;
+    }
+
+    /**
+     * Converts the list of PCM audio packets to MP3 encoded without finalizing the encoder.  Use this when writing
+     * multiple audio segments to a single MP3 stream and call {@link #flush()} once when the stream is complete.
+     *
+     * @param audioPackets of PCM audio sampled at 8 kHz
+     * @return encoded MP3 audio
+     */
+    public List<byte[]> convertStreaming(List<float[]> audioPackets)
+    {
         List<byte[]> converted = new ArrayList<>();
 
         if(mNormalizeAudio)
         {
-            audioPackets = AudioUtils.normalize(audioPackets);
+            audioPackets = AudioUtils.normalize(copy(audioPackets));
         }
 
         if(mResampler != null)
@@ -135,14 +156,19 @@ public class MP3AudioConverter implements IAudioConverter
             }
         }
 
-        int finalChunkSize = mEncoder.encodeFinish(mOutputFramesBuffer);
+        return converted;
+    }
 
-        if(finalChunkSize > 0)
+    private List<float[]> copy(List<float[]> audioPackets)
+    {
+        List<float[]> copy = new ArrayList<>();
+
+        for(float[] audioPacket: audioPackets)
         {
-            converted.add(Arrays.copyOf(mOutputFramesBuffer, finalChunkSize));
+            copy.add(Arrays.copyOf(audioPacket, audioPacket.length));
         }
 
-        return converted;
+        return copy;
     }
 
     @Override

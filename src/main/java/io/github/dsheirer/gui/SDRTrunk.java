@@ -63,6 +63,7 @@ import io.github.dsheirer.spectrum.ClickToTuneController;
 import io.github.dsheirer.preference.UserPreferences;
 import io.github.dsheirer.properties.SystemProperties;
 import io.github.dsheirer.record.AudioRecordingManager;
+import io.github.dsheirer.record.LiveAudioRecordingManager;
 import io.github.dsheirer.sample.Listener;
 import io.github.dsheirer.settings.SettingsManager;
 import io.github.dsheirer.source.ComplexSource;
@@ -146,6 +147,7 @@ public class SDRTrunk implements Listener<TunerEvent>
     private boolean mNowPlayingDetailsVisible;
     private AudioRecordingManager mAudioRecordingManager;
     private AudioStreamingManager mAudioStreamingManager;
+    private LiveAudioRecordingManager mLiveAudioRecordingManager;
     private BroadcastStatusPanel mBroadcastStatusPanel;
     private ControllerPanel mControllerPanel;
     private DiagnosticMonitor mDiagnosticMonitor;
@@ -269,6 +271,9 @@ public class SDRTrunk implements Listener<TunerEvent>
         mAudioRecordingManager = new AudioRecordingManager(mUserPreferences);
         mAudioRecordingManager.start();
 
+        mLiveAudioRecordingManager = new LiveAudioRecordingManager(mUserPreferences);
+        mLiveAudioRecordingManager.start();
+
         mAudioStreamingManager = new AudioStreamingManager(mPlaylistManager.getBroadcastModel(), BroadcastFormat.MP3,
             mUserPreferences);
         mAudioStreamingManager.start();
@@ -277,6 +282,7 @@ public class SDRTrunk implements Listener<TunerEvent>
 
         mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(duplicateCallDetector);
         mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(audioPlaybackManager);
+        mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(mLiveAudioRecordingManager);
         mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(mAudioRecordingManager);
         mPlaylistManager.getChannelProcessingManager().addAudioSegmentListener(mAudioStreamingManager);
 
@@ -287,8 +293,8 @@ public class SDRTrunk implements Listener<TunerEvent>
 
         if(!GraphicsEnvironment.isHeadless())
         {
-            mControllerPanel = new ControllerPanel(mPlaylistManager, audioPlaybackManager, mIconModel, mapService,
-                    mSettingsManager, mTunerManager, mUserPreferences, mNowPlayingDetailsVisible);
+            mControllerPanel = new ControllerPanel(mPlaylistManager, audioPlaybackManager, mLiveAudioRecordingManager,
+                    mIconModel, mapService, mSettingsManager, mTunerManager, mUserPreferences, mNowPlayingDetailsVisible);
         }
 
         mSpectralPanel = new SpectralDisplayPanel(mPlaylistManager, mSettingsManager, mTunerManager.getDiscoveredTunerModel());
@@ -855,6 +861,7 @@ public class SDRTrunk implements Listener<TunerEvent>
         mJavaFxWindowManager.shutdown();
         mLog.info("Stopping channels ...");
         mPlaylistManager.getChannelProcessingManager().shutdown();
+        mLiveAudioRecordingManager.stop();
         mAudioRecordingManager.stop();
         mResourceMonitor.stop();
 

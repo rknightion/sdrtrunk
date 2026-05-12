@@ -225,6 +225,7 @@ class BandScanControllerTest
     private static class RecordingChannelProcessingManager
     {
         private final List<Channel> mStarted = new ArrayList<>();
+        private final List<Channel> mStopped = new ArrayList<>();
         private boolean mThrowOnStart = false;
 
         void setThrowOnStart(boolean throwOnStart)
@@ -243,12 +244,17 @@ class BandScanControllerTest
 
         void stop(Channel channel)
         {
-            // no-op in tests
+            mStopped.add(channel);
         }
 
         List<Channel> getStarted()
         {
             return Collections.unmodifiableList(mStarted);
+        }
+
+        List<Channel> getStopped()
+        {
+            return Collections.unmodifiableList(mStopped);
         }
     }
 
@@ -784,7 +790,60 @@ class BandScanControllerTest
 
         assertNotNull(channel);
         assertEquals(channel, d.getCreatedChannel());
+        assertTrue(channel.isTemporaryLive());
         assertTrue(mChannelProcessingManager.getStarted().contains(channel));
+    }
+
+    @Test
+    void saveCreatedChannelPromotesTemporaryChannel() throws InterruptedException
+    {
+        ClassificationResult identified = ClassificationResult.identified(
+            FREQ_A,
+            List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
+            DecoderType.NBFM, null, SignalKind.CONVENTIONAL, "NBFM", Map.of(), -70.0);
+
+        BandScanController ctrl = makeController(
+            new FakeSurvey(List.of(makePeak(FREQ_A))),
+            new FakeClassifier(Map.of(FREQ_A, identified)));
+
+        ctrl.startScan(simpleScan());
+        awaitState(ctrl, ScanState.DONE, 5_000);
+
+        Discovery discovery = mModel.getDiscoveries().get(0);
+        Channel channel = ctrl.addAsChannel(discovery);
+
+        assertNotNull(channel);
+        assertTrue(channel.isTemporaryLive());
+
+        ctrl.saveCreatedChannel(discovery);
+
+        assertFalse(channel.isTemporaryLive());
+        assertEquals(channel, discovery.getCreatedChannel());
+    }
+
+    @Test
+    void removeCreatedChannelStopsAndRemovesTemporaryChannel() throws InterruptedException
+    {
+        ClassificationResult identified = ClassificationResult.identified(
+            FREQ_A,
+            List.of(new Candidate(DecoderType.NBFM, LockState.LOCKED, 0.9, null)),
+            DecoderType.NBFM, null, SignalKind.CONVENTIONAL, "NBFM", Map.of(), -70.0);
+
+        BandScanController ctrl = makeController(
+            new FakeSurvey(List.of(makePeak(FREQ_A))),
+            new FakeClassifier(Map.of(FREQ_A, identified)));
+
+        ctrl.startScan(simpleScan());
+        awaitState(ctrl, ScanState.DONE, 5_000);
+
+        Discovery discovery = mModel.getDiscoveries().get(0);
+        Channel channel = ctrl.addAsChannel(discovery);
+
+        ctrl.removeCreatedChannel(discovery);
+
+        assertTrue(mChannelProcessingManager.getStopped().contains(channel));
+        assertFalse(mChannelModel.getChannels().contains(channel));
+        assertNull(discovery.getCreatedChannel());
     }
 
     @Test

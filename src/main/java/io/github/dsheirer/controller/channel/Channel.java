@@ -83,6 +83,7 @@ public class Channel extends Configuration implements Listener<SourceEvent>
 
     private BooleanProperty mProcessing = new SimpleBooleanProperty();
     private BooleanProperty mAutoStart = new SimpleBooleanProperty();
+    private BooleanProperty mTemporaryLive = new SimpleBooleanProperty();
     private IntegerProperty mAutoStartOrder = new SimpleIntegerProperty();
     private boolean mSelected;
     private List<TunerChannel> mTunerChannels = null;
@@ -308,6 +309,15 @@ public class Channel extends Configuration implements Listener<SourceEvent>
     }
 
     /**
+     * Temporary live property. Indicates that this channel was created by an on-the-fly UX action
+     * and should not be persisted unless the operator explicitly saves it.
+     */
+    public BooleanProperty temporaryLiveProperty()
+    {
+        return mTemporaryLive;
+    }
+
+    /**
      * Auto-start order property.  Indicates the order for starting channels that are flagged for auto-start.
      */
     public IntegerProperty autoStartOrderProperty()
@@ -381,6 +391,25 @@ public class Channel extends Configuration implements Listener<SourceEvent>
     public boolean isStandardChannel()
     {
         return mChannelType == ChannelType.STANDARD;
+    }
+
+    /**
+     * Indicates if this channel is an on-the-fly live channel that is excluded from playlist persistence.
+     */
+    @JsonIgnore
+    public boolean isTemporaryLive()
+    {
+        return mTemporaryLive.get();
+    }
+
+    /**
+     * Sets the on-the-fly temporary live state.
+     *
+     * @param temporaryLive true to exclude this channel from playlist persistence
+     */
+    public void setTemporaryLive(boolean temporaryLive)
+    {
+        mTemporaryLive.set(temporaryLive);
     }
 
     /**
@@ -799,6 +828,6 @@ public class Channel extends Configuration implements Listener<SourceEvent>
     {
         return (Channel c) -> new Observable[] {c.processingProperty(), c.nameProperty(), c.aliasListNameProperty(),
             c.autoStartOrderProperty(), c.autoStartProperty(), c.siteProperty(), c.systemProperty(),
-            c.getFrequencyList()};
+            c.temporaryLiveProperty(), c.getFrequencyList()};
     }
 }

@@ -48,6 +48,7 @@ public class ComplexMixerFactory
                 {
                     return new VectorComplexMixer(frequency, sampleRate);
                 }
+            case UNCALIBRATED:
             case SCALAR:
                 {
                     return new ScalarComplexMixer(frequency, sampleRate);

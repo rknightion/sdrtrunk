@@ -19,6 +19,7 @@
 package io.github.dsheirer.module.discovery;
 
 import io.github.dsheirer.controller.channel.Channel;
+import io.github.dsheirer.controller.channel.ChannelActions;
 import io.github.dsheirer.controller.channel.ChannelEvent;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelModel;
@@ -454,6 +455,47 @@ public class BandScanController
                 addAsChannel(d);
             }
         }
+    }
+
+    /**
+     * Removes the temporary live channel created from a discovery.
+     *
+     * @param discovery discovery whose created channel should be removed
+     */
+    public void removeCreatedChannel(Discovery discovery)
+    {
+        if(discovery == null || discovery.getCreatedChannel() == null)
+        {
+            return;
+        }
+
+        Channel channel = discovery.getCreatedChannel();
+
+        if(channel.isTemporaryLive())
+        {
+            ChannelActions.removeTemporaryLive(mChannelModel, mChannelProcessingManager, channel);
+        }
+    }
+
+    /**
+     * Saves the temporary live channel created from a discovery into the playlist.
+     *
+     * @param discovery discovery whose created channel should be saved
+     */
+    public void saveCreatedChannel(Discovery discovery)
+    {
+        if(discovery == null || discovery.getCreatedChannel() == null)
+        {
+            return;
+        }
+
+        Channel channel = discovery.getCreatedChannel();
+        ChannelActions.saveToPlaylist(channel);
+        FxThreads.run(() -> {
+            discovery.setCreatedChannel(null);
+            discovery.setCreatedChannel(channel);
+        });
+        mDiscoveryModel.update(discovery);
     }
 
     /**

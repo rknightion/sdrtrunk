@@ -37,6 +37,7 @@ import org.slf4j.LoggerFactory;
  * <ul>
  *   <li>{@code "Discovered <freq_MHz>"} for conventional / traffic / unknown signals</li>
  *   <li>{@code "Discovered <freq_MHz> (control)"} when {@code result.kind() == CONTROL}</li>
+ *   <li>{@code "Discovered <freq_MHz> (data)"} when {@code result.kind() == DATA}</li>
  * </ul>
  *
  * <h3>Decode configuration</h3>
@@ -72,6 +73,7 @@ public class DiscoveryChannelFactory
         String name = buildChannelName(result.centerFrequencyHz(), result.kind());
 
         Channel channel = new Channel(name);
+        channel.setTemporaryLive(true);
         channel.setSourceConfiguration(buildSourceConfig(result.centerFrequencyHz()));
 
         // Always use a fresh decode config — never share the object in the result
@@ -113,6 +115,7 @@ public class DiscoveryChannelFactory
         String name = buildChannelName(freqHz, SignalKind.UNKNOWN);
 
         Channel channel = new Channel(name);
+        channel.setTemporaryLive(true);
         channel.setSourceConfiguration(buildSourceConfig(freqHz));
         channel.setDecodeConfiguration(DecoderFactory.getDecodeConfiguration(type));
 
@@ -134,7 +137,7 @@ public class DiscoveryChannelFactory
      * Builds the human-readable channel name for a discovered signal.
      *
      * @param freqHz frequency in Hz
-     * @param kind   signal kind — appends " (control)" for {@link SignalKind#CONTROL}
+     * @param kind   signal kind — appends a short suffix for control/data signals
      * @return the channel name string
      */
     static String buildChannelName(long freqHz, SignalKind kind)
@@ -147,6 +150,10 @@ public class DiscoveryChannelFactory
         if(kind == SignalKind.CONTROL)
         {
             name += " (control)";
+        }
+        else if(kind == SignalKind.DATA)
+        {
+            name += " (data)";
         }
 
         return name;

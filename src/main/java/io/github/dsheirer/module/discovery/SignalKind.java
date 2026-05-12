@@ -26,7 +26,10 @@ public enum SignalKind
     /** A trunking control channel (P25, DMR, LTR, MPT1327, Passport). */
     CONTROL,
 
-    /** A conventional (non-trunked) voice or data channel. */
+    /** A decoded data channel or data burst. */
+    DATA,
+
+    /** A conventional voice channel or generic active conventional signal. */
     CONVENTIONAL,
 
     /** A trunked voice or data traffic channel. */

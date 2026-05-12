@@ -217,10 +217,17 @@ public class ComplexSampleFanout
         public void start() {}
 
         @Override
-        public void stop() {}
+        public void stop()
+        {
+            mSampleListener = null;
+            mSourceEventListener = null;
+        }
 
         @Override
-        public void dispose() {}
+        public void dispose()
+        {
+            stop();
+        }
 
         // Called by the fanout to push samples into this subscriber
         void deliver(ComplexSamples samples)

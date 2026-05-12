@@ -446,7 +446,9 @@ public class PlaylistManager implements Listener<ChannelEvent>
 
         playlist.setAliases(new ArrayList(mAliasModel.getAliases()));
         playlist.setBroadcastConfigurations(new ArrayList(mBroadcastModel.getBroadcastConfigurations()));
-        playlist.setChannels(new ArrayList(mChannelModel.getChannels()));
+        playlist.setChannels(new ArrayList(mChannelModel.getChannels().stream()
+            .filter(channel -> !channel.isTemporaryLive())
+            .toList()));
         playlist.setChannelMaps(new ArrayList(mChannelMapModel.getChannelMaps()));
         playlist.setVersion(PLAYLIST_CURRENT_VERSION);
 

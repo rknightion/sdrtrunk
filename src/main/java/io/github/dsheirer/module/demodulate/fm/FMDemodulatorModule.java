@@ -100,6 +100,8 @@ public class FMDemodulatorModule extends Module implements ISourceEventListener,
     @Override
     public void dispose()
     {
+        removeBufferListener();
+        removeSourceEventListener();
         mDemodulator = null;
     }
 
@@ -125,6 +127,13 @@ public class FMDemodulatorModule extends Module implements ISourceEventListener,
     @Override
     public void receive(ComplexSamples samples)
     {
+        IDemodulator demodulator = mDemodulator;
+
+        if(demodulator == null)
+        {
+            return;
+        }
+
         if(mIBasebandFilter == null || mIDecimationFilter == null)
         {
             throw new IllegalStateException("FM demodulator module must receive a sample rate change source " +
@@ -135,7 +144,7 @@ public class FMDemodulatorModule extends Module implements ISourceEventListener,
         float[] decimatedQ = mQDecimationFilter.decimateReal(samples.q());
         float[] filteredI = mIBasebandFilter.filter(decimatedI);
         float[] filteredQ = mQBasebandFilter.filter(decimatedQ);
-        float[] demodulated = mDemodulator.demodulate(filteredI, filteredQ);
+        float[] demodulated = demodulator.demodulate(filteredI, filteredQ);
         mPowerMonitor.process(filteredI, filteredQ);
 
         if(mResampler != null)

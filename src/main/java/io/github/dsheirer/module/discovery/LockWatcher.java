@@ -147,11 +147,15 @@ public class LockWatcher implements IDecoderStateEventListener, IdentifierUpdate
             else if(mKind != SignalKind.CONTROL)
             {
                 // Only update kind if we haven't confirmed CONTROL
-                if(state == State.CALL || state == State.ACTIVE || state == State.DATA)
+                if(state == State.DATA)
+                {
+                    mKind = SignalKind.DATA;
+                }
+                else if(mKind != SignalKind.DATA && (state == State.CALL || state == State.ACTIVE))
                 {
                     mKind = SignalKind.CONVENTIONAL;
                 }
-                else if(state == State.ENCRYPTED)
+                else if(mKind != SignalKind.DATA && state == State.ENCRYPTED)
                 {
                     mKind = SignalKind.CONVENTIONAL; // encrypted conventional
                 }

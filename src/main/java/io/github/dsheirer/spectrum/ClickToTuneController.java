@@ -72,6 +72,16 @@ import org.slf4j.LoggerFactory;
 public class ClickToTuneController
 {
     private static final Logger mLog = LoggerFactory.getLogger(ClickToTuneController.class);
+    private static final long CLICK_SEARCH_STEP_HZ = 2_500L;
+    private static final long CLICK_SEARCH_MAX_OFFSET_HZ = 7_500L;
+    private static final List<Long> CLICK_SEARCH_OFFSETS_HZ = List.of(
+        0L,
+        -CLICK_SEARCH_STEP_HZ,
+        CLICK_SEARCH_STEP_HZ,
+        -(CLICK_SEARCH_STEP_HZ * 2),
+        CLICK_SEARCH_STEP_HZ * 2,
+        -CLICK_SEARCH_MAX_OFFSET_HZ,
+        CLICK_SEARCH_MAX_OFFSET_HZ);
 
     private final SignalClassifier mSignalClassifier;
     private final ChannelModel mChannelModel;
@@ -201,12 +211,10 @@ public class ClickToTuneController
             prior.cancel(true);
         }
 
-        mUICallbacks.showPending(centerFreqHz, bwHz);
+        mUICallbacks.showPending(centerFreqHz, pendingSearchWidthHz(bwHz));
 
-        ClassificationRequest request = ClassificationRequest.forFrequency(centerFreqHz, bwHz,
-            "click-to-tune@" + centerFreqHz);
-
-        CompletableFuture<ClassificationResult> future = mSignalClassifier.classify(request);
+        CompletableFuture<ClassificationResult> future =
+            classifyWithFrequencySearch(centerFreqHz, bwHz, "click-to-tune", null);
 
         // Only proceed with this result if this is still the current pending future
         mPendingFuture.set(future);
@@ -480,13 +488,10 @@ public class ClickToTuneController
             prior.cancel(true);
         }
 
-        mUICallbacks.showPending(centerFreqHz, bwHz);
+        mUICallbacks.showPending(centerFreqHz, pendingSearchWidthHz(bwHz));
 
-        ClassificationRequest request = ClassificationRequest.forFrequency(
-            centerFreqHz, bwHz, null,
-            "keep-listening@" + centerFreqHz, deadline);
-
-        CompletableFuture<ClassificationResult> future = mSignalClassifier.classify(request);
+        CompletableFuture<ClassificationResult> future =
+            classifyWithFrequencySearch(centerFreqHz, bwHz, "keep-listening", deadline);
         mPendingFuture.set(future);
 
         future.whenComplete((result, ex) -> SwingUtilities.invokeLater(() ->
@@ -497,6 +502,206 @@ public class ClickToTuneController
             }
             handleResult(result, ex);
         }));
+    }
+
+    /**
+     * Runs auto-detect at the clicked frequency first, then expands left/right in small steps.
+     * This compensates for coarse waterfall/spectrum hit targets without changing manual
+     * "decode here as" behavior.
+     */
+    private CompletableFuture<ClassificationResult> classifyWithFrequencySearch(long centerFreqHz, int bwHz,
+                                                                                 String labelPrefix,
+                                                                                 Duration deadline)
+    {
+        AtomicReference<CompletableFuture<ClassificationResult>> activeProbeFuture = new AtomicReference<>();
+        Duration totalDeadline = normalizedSearchDeadline(deadline);
+        long searchDeadlineNanos;
+
+        try
+        {
+            searchDeadlineNanos = Math.addExact(System.nanoTime(), totalDeadline.toNanos());
+        }
+        catch(ArithmeticException e)
+        {
+            searchDeadlineNanos = Long.MAX_VALUE;
+        }
+
+        CompletableFuture<ClassificationResult> searchFuture = new CompletableFuture<>()
+        {
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning)
+            {
+                boolean cancelled = super.cancel(mayInterruptIfRunning);
+                CompletableFuture<ClassificationResult> active = activeProbeFuture.get();
+
+                if(active != null)
+                {
+                    active.cancel(mayInterruptIfRunning);
+                }
+
+                return cancelled;
+            }
+        };
+
+        classifyNextSearchOffset(searchFuture, activeProbeFuture, centerFreqHz, bwHz, labelPrefix, totalDeadline,
+            searchDeadlineNanos, 0, null);
+        return searchFuture;
+    }
+
+    private void classifyNextSearchOffset(CompletableFuture<ClassificationResult> searchFuture,
+                                           AtomicReference<CompletableFuture<ClassificationResult>> activeProbeFuture,
+                                           long centerFreqHz, int bwHz, String labelPrefix, Duration totalDeadline,
+                                           long searchDeadlineNanos, int offsetIndex, ClassificationResult bestMiss)
+    {
+        if(searchFuture.isDone())
+        {
+            return;
+        }
+
+        if(offsetIndex >= CLICK_SEARCH_OFFSETS_HZ.size())
+        {
+            completeSearchMiss(searchFuture, centerFreqHz, bestMiss);
+            return;
+        }
+
+        Duration probeDeadline = offsetIndex == 0 ? totalDeadline : remainingSearchDeadline(searchDeadlineNanos);
+
+        if(probeDeadline == null)
+        {
+            completeSearchMiss(searchFuture, centerFreqHz, bestMiss);
+            return;
+        }
+
+        long probeFreqHz = centerFreqHz + CLICK_SEARCH_OFFSETS_HZ.get(offsetIndex);
+
+        if(probeFreqHz <= 0)
+        {
+            classifyNextSearchOffset(searchFuture, activeProbeFuture, centerFreqHz, bwHz, labelPrefix, totalDeadline,
+                searchDeadlineNanos, offsetIndex + 1, bestMiss);
+            return;
+        }
+
+        ClassificationRequest request = buildSearchRequest(probeFreqHz, bwHz,
+            buildSearchLabel(labelPrefix, centerFreqHz, probeFreqHz), probeDeadline);
+        CompletableFuture<ClassificationResult> probeFuture;
+
+        try
+        {
+            probeFuture = mSignalClassifier.classify(request);
+        }
+        catch(Throwable t)
+        {
+            searchFuture.completeExceptionally(t);
+            return;
+        }
+
+        activeProbeFuture.set(probeFuture);
+        probeFuture.whenComplete((result, ex) ->
+        {
+            if(searchFuture.isDone())
+            {
+                return;
+            }
+
+            if(ex instanceof CancellationException)
+            {
+                searchFuture.cancel(true);
+                return;
+            }
+
+            if(ex != null)
+            {
+                searchFuture.completeExceptionally(ex);
+                return;
+            }
+
+            if(result != null && result.outcome() == ClassificationOutcome.IDENTIFIED)
+            {
+                searchFuture.complete(result);
+                return;
+            }
+
+            classifyNextSearchOffset(searchFuture, activeProbeFuture, centerFreqHz, bwHz, labelPrefix, totalDeadline,
+                searchDeadlineNanos, offsetIndex + 1, selectBestMiss(bestMiss, result));
+        });
+    }
+
+    private static void completeSearchMiss(CompletableFuture<ClassificationResult> searchFuture, long centerFreqHz,
+                                           ClassificationResult bestMiss)
+    {
+        searchFuture.complete(bestMiss != null ? bestMiss : ClassificationResult.noSignal(centerFreqHz, Double.NaN));
+    }
+
+    private static Duration normalizedSearchDeadline(Duration deadline)
+    {
+        if(deadline == null || deadline.isNegative() || deadline.isZero())
+        {
+            return ClassificationRequest.DEFAULT_DEADLINE;
+        }
+
+        return deadline;
+    }
+
+    private static Duration remainingSearchDeadline(long searchDeadlineNanos)
+    {
+        long remainingNanos = searchDeadlineNanos - System.nanoTime();
+        return remainingNanos > 0 ? Duration.ofNanos(remainingNanos) : null;
+    }
+
+    private static ClassificationRequest buildSearchRequest(long probeFreqHz, int bwHz, String label,
+                                                            Duration deadline)
+    {
+        if(deadline != null)
+        {
+            return ClassificationRequest.forFrequency(probeFreqHz, bwHz, null, label, deadline);
+        }
+
+        return ClassificationRequest.forFrequency(probeFreqHz, bwHz, label);
+    }
+
+    private static String buildSearchLabel(String labelPrefix, long centerFreqHz, long probeFreqHz)
+    {
+        long offsetHz = probeFreqHz - centerFreqHz;
+
+        if(offsetHz == 0)
+        {
+            return labelPrefix + "@" + centerFreqHz;
+        }
+
+        return labelPrefix + "@" + centerFreqHz + (offsetHz > 0 ? "+" : "") + offsetHz;
+    }
+
+    private static ClassificationResult selectBestMiss(ClassificationResult current, ClassificationResult candidate)
+    {
+        if(candidate == null)
+        {
+            return current;
+        }
+
+        if(current == null)
+        {
+            return candidate;
+        }
+
+        if(current.outcome() == ClassificationOutcome.NO_SIGNAL &&
+            candidate.outcome() == ClassificationOutcome.UNIDENTIFIED)
+        {
+            return candidate;
+        }
+
+        if(current.outcome() == ClassificationOutcome.ERROR &&
+            candidate.outcome() != ClassificationOutcome.ERROR)
+        {
+            return candidate;
+        }
+
+        return current;
+    }
+
+    private static int pendingSearchWidthHz(int bwHz)
+    {
+        long widthHz = Math.max(1L, (long)bwHz + (CLICK_SEARCH_MAX_OFFSET_HZ * 2));
+        return widthHz > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int)widthHz;
     }
 
     /**

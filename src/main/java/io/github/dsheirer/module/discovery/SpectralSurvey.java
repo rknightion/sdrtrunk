@@ -343,8 +343,10 @@ public class SpectralSurvey implements SpectralSurveyApi
     {
         long span = maxHz - minHz;
         double sampleRate = tunerControl.getCurrentSampleRateHz();
+        long usableBandwidth = tunerControl.getUsableBandwidthHz();
+        long instantaneousBandwidth = usableBandwidth > 0 ? usableBandwidth : (long)sampleRate;
 
-        if(span <= (long) sampleRate)
+        if(span <= instantaneousBandwidth)
         {
             // In-band path: the entire requested span fits within the tuner's instantaneous view
             return doInBandSurvey(minHz, maxHz, dwell, thresholdDb, progress, tunerControl, cancelledFlag);

@@ -21,6 +21,7 @@ package io.github.dsheirer.gui.playlist.channel;
 
 import com.google.common.base.Joiner;
 import io.github.dsheirer.controller.channel.Channel;
+import io.github.dsheirer.controller.channel.ChannelActions;
 import io.github.dsheirer.gui.playlist.IAliasListRefreshListener;
 import io.github.dsheirer.module.decode.DecoderFactory;
 import io.github.dsheirer.module.decode.DecoderType;
@@ -46,6 +47,7 @@ import javafx.scene.Node;
 import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
+import javafx.scene.control.ContextMenu;
 import javafx.scene.control.Label;
 import javafx.scene.control.Menu;
 import javafx.scene.control.MenuButton;
@@ -54,10 +56,12 @@ import javafx.scene.control.SeparatorMenuItem;
 import javafx.scene.control.SplitPane;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
+import javafx.scene.control.TableRow;
 import javafx.scene.control.TableView;
 import javafx.scene.control.TextField;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.cell.PropertyValueFactory;
+import javafx.scene.input.KeyCode;
 import javafx.scene.input.MouseButton;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
@@ -478,6 +482,19 @@ public class ChannelEditor extends SplitPane implements IFilterProcessor, IAlias
             nameColumn.setCellValueFactory(new PropertyValueFactory<>("name"));
             nameColumn.setPrefWidth(200);
 
+            TableColumn<Channel,Boolean> liveColumn = new TableColumn<>("Live");
+            liveColumn.setCellValueFactory(param -> param.getValue().temporaryLiveProperty());
+            liveColumn.setPrefWidth(55);
+            liveColumn.setCellFactory(param -> new TableCell<>()
+            {
+                @Override
+                protected void updateItem(Boolean item, boolean empty)
+                {
+                    setAlignment(Pos.CENTER);
+                    setText(empty || item == null || !item ? null : "Live");
+                }
+            });
+
             TableColumn frequencyColumn = new TableColumn("Frequency");
             frequencyColumn.setCellValueFactory(new FrequencyCellValueFactory());
             frequencyColumn.setPrefWidth(100);
@@ -486,7 +503,7 @@ public class ChannelEditor extends SplitPane implements IFilterProcessor, IAlias
             protocolColumn.setCellValueFactory(new ProtocolCellValueFactory());
             protocolColumn.setPrefWidth(100);
 
-            mChannelTableView.getColumns().addAll(systemColumn, siteColumn, nameColumn, frequencyColumn, protocolColumn,
+            mChannelTableView.getColumns().addAll(systemColumn, siteColumn, nameColumn, liveColumn, frequencyColumn, protocolColumn,
                 playingColumn, autoStartColumn);
             mChannelTableView.setPlaceholder(getPlaceholderLabel());
 
@@ -502,6 +519,24 @@ public class ChannelEditor extends SplitPane implements IFilterProcessor, IAlias
                 {
                     getChannelConfigurationEditor().startChannel();
                 }
+            });
+            mChannelTableView.setOnKeyPressed(event -> {
+                if(event.getCode() == KeyCode.DELETE)
+                {
+                    deleteSelectedChannel();
+                    event.consume();
+                }
+            });
+            mChannelTableView.setRowFactory(tv -> {
+                TableRow<Channel> row = new TableRow<>();
+                row.setOnContextMenuRequested(event -> {
+                    if(!row.isEmpty())
+                    {
+                        getChannelTableView().getSelectionModel().select(row.getItem());
+                        buildChannelContextMenu(row.getItem()).show(row, event.getScreenX(), event.getScreenY());
+                    }
+                });
+                return row;
             });
         }
 
@@ -565,40 +600,88 @@ public class ChannelEditor extends SplitPane implements IFilterProcessor, IAlias
             mDeleteButton = new Button("Delete");
             mDeleteButton.setDisable(true);
             mDeleteButton.setMaxWidth(Double.MAX_VALUE);
-            mDeleteButton.setOnAction(event -> {
-                Channel selected = getChannelTableView().getSelectionModel().getSelectedItem();
-
-                if(selected != null)
-                {
-                    Alert alert = new Alert(Alert.AlertType.CONFIRMATION,
-                        "Do you want to delete the selected channel?", ButtonType.NO, ButtonType.YES);
-                    alert.setTitle("Delete Channel");
-                    alert.setHeaderText("Are you sure?");
-                    alert.initOwner(((Node)getDeleteButton()).getScene().getWindow());
-
-                    Optional<ButtonType> result = alert.showAndWait();
-
-                    if(result.get() == ButtonType.YES)
-                    {
-                        if(selected.isProcessing())
-                        {
-                            try
-                            {
-                                mPlaylistManager.getChannelProcessingManager().stop(selected);
-                            }
-                            catch(Exception e)
-                            {
-                                mLog.error("Couldn't stop channel [" + selected.getName() + "] prior to delete by user");
-                            }
-                        }
-
-                        mPlaylistManager.getChannelModel().removeChannel(selected);
-                    }
-                }
-            });
+            mDeleteButton.setOnAction(event -> deleteSelectedChannel());
         }
 
         return mDeleteButton;
+    }
+
+    private ContextMenu buildChannelContextMenu(Channel channel)
+    {
+        ContextMenu menu = new ContextMenu();
+
+        if(channel.isProcessing())
+        {
+            MenuItem stopItem = new MenuItem("Stop");
+            stopItem.setOnAction(event ->
+                ChannelActions.stop(mPlaylistManager.getChannelProcessingManager(), channel));
+            menu.getItems().add(stopItem);
+        }
+
+        if(channel.isTemporaryLive())
+        {
+            MenuItem saveItem = new MenuItem("Save to playlist");
+            saveItem.setOnAction(event -> ChannelActions.saveToPlaylist(channel));
+            menu.getItems().add(saveItem);
+
+            MenuItem removeItem = new MenuItem("Remove live channel");
+            removeItem.setOnAction(event -> ChannelActions.removeTemporaryLive(mPlaylistManager.getChannelModel(),
+                mPlaylistManager.getChannelProcessingManager(), channel));
+            menu.getItems().add(removeItem);
+        }
+        else
+        {
+            MenuItem deleteItem = new MenuItem("Delete");
+            deleteItem.setOnAction(event -> deleteChannel(channel));
+            menu.getItems().add(deleteItem);
+        }
+
+        return menu;
+    }
+
+    private void deleteSelectedChannel()
+    {
+        deleteChannel(getChannelTableView().getSelectionModel().getSelectedItem());
+    }
+
+    private void deleteChannel(Channel selected)
+    {
+        if(selected == null)
+        {
+            return;
+        }
+
+        if(selected.isTemporaryLive())
+        {
+            ChannelActions.removeTemporaryLive(mPlaylistManager.getChannelModel(),
+                mPlaylistManager.getChannelProcessingManager(), selected);
+            return;
+        }
+
+        Alert alert = new Alert(Alert.AlertType.CONFIRMATION,
+            "Do you want to delete the selected channel?", ButtonType.NO, ButtonType.YES);
+        alert.setTitle("Delete Channel");
+        alert.setHeaderText("Are you sure?");
+        alert.initOwner(((Node)getDeleteButton()).getScene().getWindow());
+
+        Optional<ButtonType> result = alert.showAndWait();
+
+        if(result.isPresent() && result.get() == ButtonType.YES)
+        {
+            if(selected.isProcessing())
+            {
+                try
+                {
+                    mPlaylistManager.getChannelProcessingManager().stop(selected);
+                }
+                catch(Exception e)
+                {
+                    mLog.error("Couldn't stop channel [" + selected.getName() + "] prior to delete by user");
+                }
+            }
+
+            mPlaylistManager.getChannelModel().removeChannel(selected);
+        }
     }
 
     private Button getCloneButton()

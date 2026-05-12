@@ -29,6 +29,7 @@ import io.github.dsheirer.map.MapPanel;
 import io.github.dsheirer.map.MapService;
 import io.github.dsheirer.playlist.PlaylistManager;
 import io.github.dsheirer.preference.UserPreferences;
+import io.github.dsheirer.record.LiveAudioRecordingManager;
 import io.github.dsheirer.settings.SettingsManager;
 import io.github.dsheirer.source.tuner.manager.TunerManager;
 import io.github.dsheirer.source.tuner.ui.TunerViewPanel;
@@ -58,11 +59,12 @@ public class ControllerPanel extends JPanel
     private JideTabbedPane mTabbedPane;
 
     public ControllerPanel(PlaylistManager playlistManager, AudioPlaybackManager audioPlaybackManager,
-                           IconModel iconModel, MapService mapService, SettingsManager settingsManager,
-                           TunerManager tunerManager, UserPreferences userPreferences, boolean detailTabsVisible)
+                           LiveAudioRecordingManager liveAudioRecordingManager, IconModel iconModel,
+                           MapService mapService, SettingsManager settingsManager, TunerManager tunerManager,
+                           UserPreferences userPreferences, boolean detailTabsVisible)
     {
         mAudioPanel = new AudioPanel(iconModel, userPreferences, settingsManager, audioPlaybackManager,
-            playlistManager.getAliasModel());
+            liveAudioRecordingManager, playlistManager.getAliasModel());
         mNowPlayingPanel = new NowPlayingPanel(playlistManager, iconModel, userPreferences, settingsManager, detailTabsVisible);
         mMapPanel = new MapPanel(mapService, playlistManager.getAliasModel(), iconModel, settingsManager);
         mTunerManagerPanel = new TunerViewPanel(tunerManager, userPreferences);

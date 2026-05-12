@@ -25,6 +25,7 @@ import io.github.dsheirer.gui.preference.PreferenceEditorType;
 import io.github.dsheirer.gui.preference.ViewUserPreferenceEditorRequest;
 import io.github.dsheirer.icon.IconModel;
 import io.github.dsheirer.preference.UserPreferences;
+import io.github.dsheirer.record.LiveAudioRecordingManager;
 import io.github.dsheirer.sample.Listener;
 import io.github.dsheirer.settings.SettingsManager;
 import java.awt.Color;
@@ -43,6 +44,7 @@ import javax.swing.JMenuItem;
 import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
 import javax.swing.JSlider;
+import javax.swing.JToggleButton;
 import javax.swing.SwingUtilities;
 
 /**
@@ -54,11 +56,13 @@ public class AudioPanel extends JPanel implements Listener<AudioEvent>
     private static final ImageIcon UNMUTED_ICON = IconModel.getScaledIcon("images/audio_unmuted.png", 20);
     private final AliasModel mAliasModel;
     private final AudioPlaybackManager mAudioPlaybackManager;
+    private final LiveAudioRecordingManager mLiveAudioRecordingManager;
     private final IconModel mIconModel;
     private final SettingsManager mSettingsManager;
     private final UserPreferences mUserPreferences;
     private AudioChannelsPanel mAudioChannelsPanel;
     private JButton mMuteButton;
+    private JToggleButton mRecordButton;
 
     /**
      * Constructs an instance
@@ -66,14 +70,17 @@ public class AudioPanel extends JPanel implements Listener<AudioEvent>
      * @param userPreferences for preference lookup
      * @param settingsManager to monitor for changes
      * @param audioPlaybackManager for accessing the audio output
+     * @param liveAudioRecordingManager for recording decoded Now Playing audio
      * @param aliasModel for alias lookup
      */
     public AudioPanel(IconModel iconModel, UserPreferences userPreferences, SettingsManager settingsManager,
-                      AudioPlaybackManager audioPlaybackManager, AliasModel aliasModel)
+                      AudioPlaybackManager audioPlaybackManager, LiveAudioRecordingManager liveAudioRecordingManager,
+                      AliasModel aliasModel)
     {
         mIconModel = iconModel;
         mSettingsManager = settingsManager;
         mAudioPlaybackManager = audioPlaybackManager;
+        mLiveAudioRecordingManager = liveAudioRecordingManager;
         mAliasModel = aliasModel;
         mUserPreferences = userPreferences;
         mAudioPlaybackManager.addAudioEventListener(this);
@@ -85,13 +92,16 @@ public class AudioPanel extends JPanel implements Listener<AudioEvent>
      */
     private void init()
     {
-        setLayout(new MigLayout("insets 0 0 0 0", "[]0[grow,fill]", "[fill]0[]"));
+        setLayout(new MigLayout("insets 0 0 0 0", "[]0[]0[grow,fill]", "[fill]0[]"));
         setBackground(Color.BLACK);
         mMuteButton = new MuteButton();
         mMuteButton.setBackground(getBackground());
         add(mMuteButton);
+        mRecordButton = new RecordButton();
+        mRecordButton.setBackground(getBackground());
+        add(mRecordButton);
         mAudioChannelsPanel = new AudioChannelsPanel(mIconModel, mUserPreferences, mSettingsManager, mAudioPlaybackManager, mAliasModel);
-        add(mAudioChannelsPanel);
+        add(mAudioChannelsPanel, "growx");
         addMouseListener(new MouseSelectionListener());
     }
 
@@ -110,7 +120,7 @@ public class AudioPanel extends JPanel implements Listener<AudioEvent>
                     remove(mAudioChannelsPanel);
                     mAudioChannelsPanel.dispose();
                     mAudioChannelsPanel = new AudioChannelsPanel(mIconModel, mUserPreferences, mSettingsManager, mAudioPlaybackManager, mAliasModel);
-                    add(mAudioChannelsPanel);
+                    add(mAudioChannelsPanel, "growx");
                     mAudioChannelsPanel.repaint();
                     revalidate();
                     repaint();
@@ -300,6 +310,38 @@ public class AudioPanel extends JPanel implements Listener<AudioEvent>
                     getAccessibleContext().setAccessibleName(mMuted ? "Unmute" : "Mute");
                 });
             });
+        }
+    }
+
+    /**
+     * Toggle button for recording all decoded Now Playing audio.
+     */
+    public class RecordButton extends JToggleButton
+    {
+        private final Icon mRecordingIcon = IconFontSwing.buildIcon(FontAwesome.CIRCLE, 16, Color.RED);
+        private final Icon mIdleIcon = IconFontSwing.buildIcon(FontAwesome.CIRCLE_O, 16, Color.LIGHT_GRAY);
+
+        public RecordButton()
+        {
+            setIcon(mIdleIcon);
+            setBorderPainted(false);
+            setFocusable(false);
+            updateState();
+
+            addActionListener(e -> {
+                mLiveAudioRecordingManager.setRecording(isSelected());
+                updateState();
+            });
+        }
+
+        private void updateState()
+        {
+            boolean recording = mLiveAudioRecordingManager.isRecording();
+            setSelected(recording);
+            setIcon(recording ? mRecordingIcon : mIdleIcon);
+            setToolTipText(recording ? "Stop recording Now Playing audio" : "Record Now Playing audio");
+            getAccessibleContext().setAccessibleName(recording ? "Stop recording Now Playing audio" :
+                "Record Now Playing audio");
         }
     }
 }

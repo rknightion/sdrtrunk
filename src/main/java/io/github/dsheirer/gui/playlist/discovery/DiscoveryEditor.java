@@ -94,6 +94,7 @@ public class DiscoveryEditor extends BorderPane
     private ComboBox<Integer> mMinPipsCombo;
     private Button mAddAllButton;
     private Button mClearFinishedButton;
+    private Button mClearAllButton;
     private Button mSettingsButton;
     private Button mManageIgnoredButton;
 
@@ -254,6 +255,10 @@ public class DiscoveryEditor extends BorderPane
         mClearFinishedButton.setTooltip(new Tooltip("Remove probed rows (IDENTIFIED, UNIDENTIFIED, ERROR, KNOWN)"));
         mClearFinishedButton.setOnAction(e -> mDiscoveryModel.clearFinished());
 
+        mClearAllButton = new Button("Clear all");
+        mClearAllButton.setTooltip(new Tooltip("Remove all discovery rows"));
+        mClearAllButton.setOnAction(e -> mDiscoveryModel.clear());
+
         mSettingsButton = new Button("Settings…");
         mSettingsButton.setTooltip(new Tooltip("Open discovery preferences"));
         mSettingsButton.setOnAction(e -> openSettings());
@@ -267,7 +272,7 @@ public class DiscoveryEditor extends BorderPane
 
         ToolBar toolbar = new ToolBar(
             mScanButton, mStopButton, mProgressBar, mStateLabel, spacer,
-            mAddAllButton, mMinPipsCombo, mClearFinishedButton,
+            mAddAllButton, mMinPipsCombo, mClearFinishedButton, mClearAllButton,
             mSettingsButton, mManageIgnoredButton
         );
 
@@ -352,7 +357,7 @@ public class DiscoveryEditor extends BorderPane
                 }
                 if(d.getCreatedChannel() != null)
                 {
-                    setText("● live");
+                    setText(d.getCreatedChannel().isTemporaryLive() ? "● live" : "● saved");
                     return;
                 }
                 DiscoveryState state = d.getState();
@@ -444,6 +449,7 @@ public class DiscoveryEditor extends BorderPane
                 String kindStr = kind == null ? "" : switch(kind)
                 {
                     case CONTROL      -> " · control";
+                    case DATA         -> " · data";
                     case CONVENTIONAL -> " · conventional";
                     case TRAFFIC      -> " · traffic";
                     case UNKNOWN      -> "";
@@ -547,7 +553,7 @@ public class DiscoveryEditor extends BorderPane
         });
         notesCol.setPrefWidth(200);
 
-        // --- Column: Actions (+ / 👁 / ✕ / ↻) ---
+        // --- Column: Actions (+ / save / remove / watch / ignore / reprobe) ---
         // Using Discovery as the cell value so that updateItem re-fires when the row's
         // observable properties change (state, createdChannel, watched).
         TableColumn<Discovery, Discovery> actionsCol = new TableColumn<>("Actions");
@@ -555,13 +561,17 @@ public class DiscoveryEditor extends BorderPane
         actionsCol.setCellFactory(col -> new TableCell<>()
         {
             private final Button mAddBtn    = new Button("+");
+            private final Button mSaveBtn   = new Button("Save");
+            private final Button mRemoveBtn = new Button("Remove");
             private final Button mWatchBtn  = new Button("👁");
             private final Button mIgnoreBtn = new Button("✕");
             private final Button mReprobeBtn= new Button("↻");
-            private final HBox mBox = new HBox(2, mAddBtn, mWatchBtn, mIgnoreBtn, mReprobeBtn);
+            private final HBox mBox = new HBox(2, mAddBtn, mSaveBtn, mRemoveBtn, mWatchBtn, mIgnoreBtn, mReprobeBtn);
 
             {
                 mAddBtn.setTooltip(new Tooltip("Add as channel"));
+                mSaveBtn.setTooltip(new Tooltip("Save live channel to playlist"));
+                mRemoveBtn.setTooltip(new Tooltip("Remove live channel"));
                 mWatchBtn.setTooltip(new Tooltip("Toggle watched"));
                 mIgnoreBtn.setTooltip(new Tooltip("Ignore this frequency"));
                 mReprobeBtn.setTooltip(new Tooltip("Re-probe"));
@@ -569,6 +579,14 @@ public class DiscoveryEditor extends BorderPane
                 mAddBtn.setOnAction(e -> {
                     Discovery d = getDiscovery();
                     if(d != null) mBandScanController.addAsChannel(d);
+                });
+                mSaveBtn.setOnAction(e -> {
+                    Discovery d = getDiscovery();
+                    if(d != null) mBandScanController.saveCreatedChannel(d);
+                });
+                mRemoveBtn.setOnAction(e -> {
+                    Discovery d = getDiscovery();
+                    if(d != null) mBandScanController.removeCreatedChannel(d);
                 });
                 mWatchBtn.setOnAction(e -> {
                     Discovery d = getDiscovery();
@@ -615,6 +633,9 @@ public class DiscoveryEditor extends BorderPane
 
                 // + button: only enabled when IDENTIFIED and not yet added
                 mAddBtn.setDisable(d.getState() != DiscoveryState.IDENTIFIED || d.getCreatedChannel() != null);
+                boolean hasTemporaryChannel = d.getCreatedChannel() != null && d.getCreatedChannel().isTemporaryLive();
+                mSaveBtn.setDisable(!hasTemporaryChannel);
+                mRemoveBtn.setDisable(!hasTemporaryChannel);
                 // 👁 button: always available
                 mWatchBtn.setStyle(d.isWatched() ? "-fx-font-weight:bold;" : "");
                 // ✕ button: always available
@@ -625,7 +646,7 @@ public class DiscoveryEditor extends BorderPane
                 setGraphic(mBox);
             }
         });
-        actionsCol.setPrefWidth(130);
+        actionsCol.setPrefWidth(260);
         actionsCol.setSortable(false);
 
         mTable.getColumns().addAll(stateCol, freqCol, bwCol, decoderCol, confCol,
@@ -673,6 +694,18 @@ public class DiscoveryEditor extends BorderPane
         if(created != null)
         {
             menu.getItems().add(new SeparatorMenuItem());
+
+            if(created.isTemporaryLive())
+            {
+                MenuItem saveChannelItem = new MenuItem("Save live channel to playlist");
+                saveChannelItem.setOnAction(e -> mBandScanController.saveCreatedChannel(discovery));
+                menu.getItems().add(saveChannelItem);
+
+                MenuItem removeChannelItem = new MenuItem("Remove live channel");
+                removeChannelItem.setOnAction(e -> mBandScanController.removeCreatedChannel(discovery));
+                menu.getItems().add(removeChannelItem);
+            }
+
             MenuItem viewChannelItem = new MenuItem("View/Edit channel");
             viewChannelItem.setOnAction(e ->
                 MyEventBus.getGlobalEventBus().post(new ViewChannelRequest(created)));
